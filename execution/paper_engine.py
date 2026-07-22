@@ -282,9 +282,12 @@ class PaperBroker:
         if position_size_pct is not None:
             lines.append(f"  Size         : {position_size_pct * 100:.0f}% of USD balance")
         if side == "SELL":
-            pnl_sign = "+" if (realized_pnl or 0) >= 0 else ""
             lines.append(f"  Entry price  : ${avg_entry:,.2f}")
-            lines.append(f"  Realized P/L : {pnl_sign}${realized_pnl:,.2f}")
+            pnl = float(realized_pnl or 0.0)
+            if pnl >= 0:
+                lines.append(f"  Realized P/L : +${pnl:,.2f}")
+            else:
+                lines.append(f"  Realized P/L : -${abs(pnl):,.2f}")
         else:
             lines.append(f"  Avg entry    : ${avg_entry:,.2f}")
         lines.extend(
@@ -296,3 +299,45 @@ class PaperBroker:
             ]
         )
         print("\n".join(lines))
+
+    def get_trades(self) -> list[Trade]:
+        with self.session_factory() as session:
+            return list(session.scalars(select(Trade).order_by(Trade.id.asc())))
+
+    def get_performance_stats(self, current_price: Optional[float] = None) -> dict:
+        """Summarize paper-trading performance for shutdown reporting."""
+        portfolio = self.get_portfolio()
+        trades = self.get_trades()
+        sells = [t for t in trades if t.side == "SELL"]
+        buys = [t for t in trades if t.side == "BUY"]
+        realized = sum(float(t.realized_pnl or 0.0) for t in sells)
+        wins = [t for t in sells if (t.realized_pnl or 0.0) > 0]
+        losses = [t for t in sells if (t.realized_pnl or 0.0) < 0]
+
+        price = float(current_price or 0.0)
+        equity = float(portfolio["usd_balance"]) + float(portfolio["btc_balance"]) * price
+        starting = float(self.initial_balance)
+        unrealized = 0.0
+        if portfolio["btc_balance"] > 0 and price > 0 and portfolio["avg_entry_price"] > 0:
+            unrealized = (price - float(portfolio["avg_entry_price"])) * float(
+                portfolio["btc_balance"]
+            )
+
+        return {
+            "starting_balance": starting,
+            "usd_balance": float(portfolio["usd_balance"]),
+            "btc_balance": float(portfolio["btc_balance"]),
+            "avg_entry_price": float(portfolio["avg_entry_price"]),
+            "current_price": price,
+            "equity": equity,
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "total_pnl": equity - starting,
+            "total_return_pct": ((equity - starting) / starting * 100.0) if starting else 0.0,
+            "trade_count": len(trades),
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "win_count": len(wins),
+            "loss_count": len(losses),
+            "win_rate_pct": (len(wins) / len(sells) * 100.0) if sells else 0.0,
+        }
