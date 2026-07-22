@@ -93,6 +93,7 @@ Default settings:
 | `PAPER_INITIAL_BALANCE` | `10000` | Starting paper balance (USD) |
 | `SYMBOL` | `BTC/USDT` | Trading pair |
 | `DATA_PROVIDER` | `binance` | Market data provider (via ccxt) |
+| `DATABASE_URL` | `sqlite:///./paper_trading.db` | SQLAlchemy database URL |
 
 ### 6. Deactivate when finished
 
@@ -152,7 +153,23 @@ strategy = EMACrossoverStrategy()
 signal = strategy.generate_signal(snapshot["candles"])  # 'BUY' | 'SELL' | 'HOLD'
 ```
 
+## Paper Execution
+
+`execution/paper_engine.py` provides `PaperBroker` backed by SQLAlchemy (`portfolio` + `trades` tables).
+
+```python
+from execution import PaperBroker
+
+broker = PaperBroker.from_database_url()  # uses DATABASE_URL / sqlite
+broker.execute_order("BUY", current_price=65000.0, position_size_pct=0.25)
+broker.execute_order("SELL", current_price=66000.0)
+print(broker.get_portfolio())
+```
+
+- **BUY** — spend 25% of USD balance on BTC, update balances, insert a trade row
+- **SELL** — liquidate all BTC, realize P/L vs average entry, update USD, insert a trade row
+- Prints timestamped terminal logs on each filled trade
+
 ## Next Steps
 
-- Wire paper execution and balance tracking in `execution/`
-- Add SQLAlchemy models in `models/`
+- Add a main loop that wires `stream_btc_data` → strategy → `PaperBroker`

@@ -17,6 +17,8 @@ build/
 logs/*
 !logs/.gitkeep
 *.log
+paper_trading.db
+*.db
 
 # IDE / OS
 .idea/

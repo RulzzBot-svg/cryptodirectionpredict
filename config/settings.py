@@ -15,6 +15,7 @@ class Settings:
     paper_initial_balance: float
     symbol: str
     data_provider: str
+    database_url: str
 
 
 def load_settings() -> Settings:
@@ -22,4 +23,5 @@ def load_settings() -> Settings:
         paper_initial_balance=float(os.getenv("PAPER_INITIAL_BALANCE", "10000")),
         symbol=os.getenv("SYMBOL", "BTC/USDT"),
         data_provider=os.getenv("DATA_PROVIDER", "binance").strip().lower(),
+        database_url=os.getenv("DATABASE_URL", "sqlite:///./paper_trading.db"),
     )
