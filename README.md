@@ -135,8 +135,24 @@ async def main():
 asyncio.run(main())
 ```
 
+## Strategies
+
+`strategies/base.py` defines `BaseStrategy`. Swap implementations by depending on that interface.
+
+`EMACrossoverStrategy` in `strategies/momentum_strategy.py`:
+
+- **BUY** when the 9 EMA crosses above the 21 EMA and RSI &lt; 60
+- **SELL** when the 9 EMA crosses below the 21 EMA
+- **HOLD** otherwise
+
+```python
+from strategies import EMACrossoverStrategy
+
+strategy = EMACrossoverStrategy()
+signal = strategy.generate_signal(snapshot["candles"])  # 'BUY' | 'SELL' | 'HOLD'
+```
+
 ## Next Steps
 
-- Define strategy interfaces in `strategies/`
 - Wire paper execution and balance tracking in `execution/`
 - Add SQLAlchemy models in `models/`
