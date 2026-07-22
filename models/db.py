@@ -44,6 +44,7 @@ def init_db(engine=None) -> None:
     """Create all tables."""
     # Import models so they register on Base.metadata
     from models import portfolio as _portfolio  # noqa: F401
+    from models import prediction as _prediction  # noqa: F401
     from models import trade as _trade  # noqa: F401
 
     eng = engine or create_db_engine()
