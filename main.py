@@ -199,7 +199,8 @@ def main() -> int:
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        # Stats are printed in run_bot's finally when the task is cancelled.
+        # run_bot's finally prints stats and closes the exchange; newline after live status.
+        print()
         return 0
     return 0
 
