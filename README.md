@@ -7,7 +7,9 @@ Python-based paper-trading bot for Bitcoin (BTC/USDT) using live, free WebSocket
 ```
 .
 ├── config/          # Configuration loading and settings
+│   └── settings.py
 ├── data/            # Market data clients (REST / WebSocket)
+│   └── feed.py      # Async BTC ticker + OHLCV stream
 ├── models/          # Data models and database schemas
 ├── strategies/      # Trading strategy implementations
 ├── execution/       # Paper order execution and portfolio tracking
@@ -109,9 +111,32 @@ deactivate
 | `python-dotenv` | Load configuration from `.env` |
 | `asyncio` | Async I/O for concurrent data streams (stdlib) |
 
+## Market Data Feed
+
+`data/feed.py` exposes `stream_btc_data(symbol, timeframe='15m')`, an async generator that:
+
+- Connects to Binance or Coinbase via **ccxt.pro** WebSockets (falls back to async REST polling)
+- Yields ticker quotes plus OHLCV candles as a pandas DataFrame
+- Adds `ema_9`, `ema_21`, and `rsi_14` columns via the `ta` library
+- Reconnects automatically on disconnects and rate limits (exponential backoff)
+
+Example:
+
+```python
+import asyncio
+from data.feed import stream_btc_data
+
+async def main():
+    async for snapshot in stream_btc_data("BTC/USDT", timeframe="15m"):
+        print(snapshot["last_price"])
+        print(snapshot["candles"][["close", "ema_9", "ema_21", "rsi_14"]].tail(3))
+        break  # remove to keep streaming
+
+asyncio.run(main())
+```
+
 ## Next Steps
 
-- Implement market data ingestion in `data/`
 - Define strategy interfaces in `strategies/`
 - Wire paper execution and balance tracking in `execution/`
 - Add SQLAlchemy models in `models/`
