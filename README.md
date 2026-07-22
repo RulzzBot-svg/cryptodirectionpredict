@@ -11,9 +11,16 @@ Python-based paper-trading bot for Bitcoin (BTC/USDT) using live, free WebSocket
 ├── data/            # Market data clients (REST / WebSocket)
 │   └── feed.py      # Async BTC ticker + OHLCV stream
 ├── models/          # Data models and database schemas
+│   ├── db.py
+│   ├── portfolio.py
+│   └── trade.py
 ├── strategies/      # Trading strategy implementations
+│   ├── base.py
+│   └── momentum_strategy.py
 ├── execution/       # Paper order execution and portfolio tracking
+│   └── paper_engine.py
 ├── logs/            # Runtime logs
+├── main.py          # Async bot entrypoint
 ├── .env.example     # Example environment variables
 ├── requirements.txt # Python dependencies
 └── README.md
@@ -111,6 +118,22 @@ deactivate
 | `ta` | Technical analysis indicators |
 | `python-dotenv` | Load configuration from `.env` |
 | `asyncio` | Async I/O for concurrent data streams (stdlib) |
+
+## Run the Bot
+
+```bash
+cp .env.example .env
+# optional: set DATA_PROVIDER=coinbase if Binance is geo-restricted
+python main.py
+```
+
+The main loop:
+
+1. Initializes the SQLite database, `PaperBroker`, and `EMACrossoverStrategy`
+2. Fetches the latest 15m BTC candles + ticker every 10 seconds
+3. Generates a signal and executes paper trades on new candle crosses
+4. Prints a live status line: price | USD | BTC | equity | signal
+5. On Ctrl+C, closes the exchange connection and prints final performance stats
 
 ## Market Data Feed
 

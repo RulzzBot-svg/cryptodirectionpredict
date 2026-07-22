@@ -35,6 +35,16 @@ def _resolve_provider(provider: Optional[str] = None) -> str:
     return name
 
 
+def create_rest_exchange(provider: Optional[str] = None):
+    """Create an async CCXT REST exchange client for the configured provider."""
+    return _create_exchange(_resolve_provider(provider), use_pro=False)
+
+
+async def close_exchange(exchange: Any) -> None:
+    """Close an async CCXT exchange client if needed."""
+    await _safe_close(exchange)
+
+
 def _create_exchange(provider: str, *, use_pro: bool):
     """Instantiate a CCXT (pro) exchange client for public market data."""
     if use_pro:
@@ -212,6 +222,43 @@ def _build_snapshot(
         "candles": candles,
         "provider": provider,
     }
+
+
+async def fetch_latest_snapshot(
+    symbol: Optional[str] = None,
+    timeframe: str = "15m",
+    *,
+    provider: Optional[str] = None,
+    ohlcv_limit: int = DEFAULT_OHLCV_LIMIT,
+    exchange: Any = None,
+) -> dict[str, Any]:
+    """
+    Fetch a single ticker + OHLCV snapshot over async REST.
+
+    If ``exchange`` is provided it is reused; otherwise a temporary client is
+    created and closed before returning.
+    """
+    resolved_symbol = symbol or os.getenv("SYMBOL", "BTC/USDT")
+    resolved_provider = _resolve_provider(provider)
+    owns_exchange = exchange is None
+
+    if owns_exchange:
+        exchange = _create_exchange(resolved_provider, use_pro=False)
+
+    try:
+        ticker, ohlcv = await _fetch_rest(
+            exchange, resolved_symbol, timeframe, ohlcv_limit
+        )
+        return _build_snapshot(
+            resolved_symbol,
+            timeframe,
+            ticker,
+            ohlcv,
+            getattr(exchange, "id", None),
+        )
+    finally:
+        if owns_exchange:
+            await _safe_close(exchange)
 
 
 async def stream_btc_data(
