@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Main entrypoint: wire market data, strategy, and paper execution."""
+"""
+BTC 15-minute prediction-market edge bot.
+
+Estimates P(finish ABOVE strike) for each wall-clock 15m window, recommends
+ABOVE / BELOW / SKIP, and optionally papers the bet against a 50/50 book.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +19,10 @@ from dotenv import load_dotenv
 
 from config.settings import load_settings
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
-from execution.paper_engine import PaperBroker
+from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
-from strategies.momentum_strategy import EMACrossoverStrategy
+from prediction.advisor import PredictionAdvisor
+from prediction.window import WindowManager
 
 load_dotenv()
 
@@ -24,70 +30,76 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+# Keep the live status line readable
+logging.getLogger("data.feed").setLevel(logging.WARNING)
+
 logger = logging.getLogger("main")
 
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", "0.25"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
+MARKET_PROB_ABOVE = float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
+CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))
+AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
+MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
 
 
 def _utcnow_label() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _fmt_mmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
 def _print_status(
     *,
     price: float,
-    usd: float,
-    btc: float,
-    equity: float,
-    signal: str,
+    strike: float,
+    remaining: float,
+    p_above: float,
+    p_below: float,
+    action: str,
+    edge: float,
+    bankroll: float,
 ) -> None:
-    """Overwrite a single live status line in the terminal."""
     line = (
         f"[{_utcnow_label()}] "
-        f"Current BTC Price ${price:,.2f} | "
-        f"USD Balance ${usd:,.2f} | "
-        f"BTC Balance {btc:.8f} | "
-        f"Total Equity ${equity:,.2f} | "
-        f"Active Signal {signal:<4}"
+        f"BTC ${price:,.2f} | "
+        f"Strike ${strike:,.2f} | "
+        f"T-{_fmt_mmss(remaining)} | "
+        f"Above {p_above * 100:5.2f}% | "
+        f"Below {p_below * 100:5.2f}% | "
+        f"Edge {edge * 100:+5.1f}¢ | "
+        f"{action:<5} | "
+        f"Bank ${bankroll:,.2f}"
     )
-    print(f"\r{line:<120}", end="", flush=True)
+    print(f"\r{line:<140}", end="", flush=True)
 
 
 def _print_performance(stats: dict[str, Any]) -> None:
     print()
     print("=" * 60)
-    print("  FINAL PERFORMANCE SUMMARY")
+    print("  PREDICTION MARKET — FINAL PERFORMANCE")
     print("=" * 60)
     print(f"  Time            : {_utcnow_label()}")
-    print(f"  Starting USD    : ${stats['starting_balance']:,.2f}")
-    print(f"  Ending USD      : ${stats['usd_balance']:,.2f}")
-    print(f"  Ending BTC      : {stats['btc_balance']:.8f}")
-    if stats["current_price"]:
-        print(f"  Last BTC price  : ${stats['current_price']:,.2f}")
-    print(f"  Total equity    : ${stats['equity']:,.2f}")
+    print(f"  Starting bank   : ${stats['starting_balance']:,.2f}")
+    print(f"  Cash bankroll   : ${stats['usd_balance']:,.2f}")
+    print(f"  Equity          : ${stats['equity']:,.2f}")
     total_pnl = stats["total_pnl"]
     pnl_label = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
     print(f"  Total P/L       : {pnl_label} ({stats['total_return_pct']:+.2f}%)")
-    realized = stats["realized_pnl"]
-    unrealized = stats["unrealized_pnl"]
+    print(f"  Realized P/L    : ${stats['realized_pnl']:,.2f}")
     print(
-        f"  Realized P/L    : "
-        f"{'+' if realized >= 0 else '-'}${abs(realized):,.2f}"
+        f"  Contracts       : {stats['bet_count']} placed / "
+        f"{stats['settled_count']} settled / {stats['open_bets']} open"
     )
-    print(
-        f"  Unrealized P/L  : "
-        f"{'+' if unrealized >= 0 else '-'}${abs(unrealized):,.2f}"
-    )
-    print(
-        f"  Trades          : {stats['trade_count']} "
-        f"({stats['buy_count']} buys / {stats['sell_count']} sells)"
-    )
-    if stats["sell_count"]:
+    if stats["win_count"] or stats["loss_count"]:
         print(
             f"  Win rate        : {stats['win_rate_pct']:.1f}% "
-            f"({stats['win_count']}W / {stats['loss_count']}L)"
+            f"({stats['win_count']}W / {stats['loss_count']}L / "
+            f"{stats['push_count']}P)"
         )
     print("=" * 60)
 
@@ -98,16 +110,19 @@ async def run_bot() -> None:
     provider = settings.data_provider
 
     print("=" * 60)
-    print("  BTC PAPER TRADING BOT")
+    print("  BTC 15m PREDICTION EDGE BOT")
     print("=" * 60)
     print(f"  Symbol          : {symbol}")
-    print(f"  Timeframe       : {TIMEFRAME}")
     print(f"  Provider        : {provider}")
+    print(f"  Candle TF       : {TIMEFRAME}")
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
-    print(f"  Position size   : {POSITION_SIZE_PCT * 100:.0f}% of USD on BUY")
+    print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢ vs market {MARKET_PROB_ABOVE * 100:.0f}¢")
+    print(f"  Contract        : ${CONTRACT_COST:.2f} → $1.00 payout")
+    print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     print(f"  Database        : {settings.database_url}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
+    print("  Reads: % chance BTC finishes ABOVE the window strike.")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -115,17 +130,21 @@ async def run_bot() -> None:
     engine = create_db_engine(settings.database_url)
     init_db(engine)
     session_factory = create_session_factory(engine)
-    broker = PaperBroker(
+    book = PredictionBook(
         session_factory,
         initial_balance=settings.paper_initial_balance,
         symbol=symbol,
+        contract_cost=CONTRACT_COST,
         engine=engine,
     )
-    strategy = EMACrossoverStrategy()
+    windows = WindowManager(window_minutes=15)
+    advisor = PredictionAdvisor(
+        min_edge=MIN_EDGE,
+        market_prob_above=MARKET_PROB_ABOVE,
+        min_seconds_to_bet=MIN_SECONDS_TO_BET,
+    )
 
     exchange: Any = None
-    last_price: Optional[float] = None
-    last_handled_candle: Any = None
     consecutive_errors = 0
 
     try:
@@ -157,49 +176,76 @@ async def run_bot() -> None:
                 continue
 
             price = float(snapshot["last_price"] or 0.0)
-            last_price = price
+            if price <= 0:
+                await asyncio.sleep(LOOP_INTERVAL_SECONDS)
+                continue
+
             candles = snapshot["candles"]
-            signal = strategy.generate_signal(candles)
+            strike_hint = None
+            if candles is not None and not candles.empty and "open" in candles.columns:
+                try:
+                    last_open = float(candles.iloc[-1]["open"])
+                    if last_open > 0:
+                        strike_hint = last_open
+                except (TypeError, ValueError, KeyError):
+                    strike_hint = None
 
-            candle_ts = candles.index[-1] if len(candles.index) else None
-            if (
-                signal in ("BUY", "SELL")
-                and candle_ts is not None
-                and candle_ts != last_handled_candle
-            ):
+            window, expired = windows.update(price, strike_price=strike_hint)
+            if expired is not None:
                 print()
-                trade = broker.execute_order(
-                    signal,
-                    current_price=price,
-                    position_size_pct=POSITION_SIZE_PCT,
+                print(
+                    f"[{_utcnow_label()}] Window {expired.window_id} settled "
+                    f"{expired.outcome} @ ${float(expired.settlement_price):,.2f} "
+                    f"(strike ${float(expired.strike):,.2f})"
                 )
-                if trade is not None:
-                    last_handled_candle = candle_ts
+                book.settle_window(expired, float(expired.settlement_price or price))
 
-            portfolio = broker.get_portfolio()
-            usd = float(portfolio["usd_balance"])
-            btc = float(portfolio["btc_balance"])
-            equity = usd + btc * price
+            if window.strike is None:
+                await asyncio.sleep(LOOP_INTERVAL_SECONDS)
+                continue
+
+            advice = advisor.advise(
+                window,
+                price,
+                snapshot["candles"],
+                market_prob_above=MARKET_PROB_ABOVE,
+            )
+
+            if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
+                print()
+                book.place_bet(
+                    window,
+                    advice,
+                    market_prob_above=MARKET_PROB_ABOVE,
+                )
+
             _print_status(
                 price=price,
-                usd=usd,
-                btc=btc,
-                equity=equity,
-                signal=signal,
+                strike=float(window.strike),
+                remaining=window.seconds_remaining(),
+                p_above=advice.prob_above,
+                p_below=advice.prob_below,
+                action=advice.action,
+                edge=advice.edge,
+                bankroll=book.get_balance(),
             )
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
+        # Settle the active window mark-to-market if a bet is open
+        if windows.current is not None and windows.current.strike is not None:
+            open_bet = book.get_open_bet(windows.current.window_id)
+            # leave OPEN bets open on shutdown (capital already deducted);
+            # performance equity credits premium back.
+            _ = open_bet
         await close_exchange(exchange)
-        stats = broker.get_performance_stats(current_price=last_price)
-        _print_performance(stats)
+        _print_performance(book.get_performance_stats())
 
 
 def main() -> int:
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        # run_bot's finally prints stats and closes the exchange; newline after live status.
         print()
         return 0
     return 0
