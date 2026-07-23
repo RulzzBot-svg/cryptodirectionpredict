@@ -44,6 +44,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logging.getLogger("data.feed").setLevel(logging.WARNING)
+logging.getLogger("data.kalshi").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 
