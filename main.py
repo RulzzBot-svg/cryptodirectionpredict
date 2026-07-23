@@ -103,10 +103,8 @@ def _print_status(
     edge: float,
     bankroll: float,
     market_prob: float,
-    kalshi_event: str = "",
 ) -> None:
     src = {"manual": "RH", "kalshi": "KL", "auto": "auto"}.get(strike_source, strike_source)
-    event_bit = f" | {kalshi_event}" if kalshi_event else ""
     line = (
         f"[{_utcnow_label()}] "
         f"BTC ${price:,.2f} | "
@@ -118,17 +116,18 @@ def _print_status(
         f"Edge {edge * 100:+5.1f}¢ | "
         f"{action:<5} | "
         f"Bank ${bankroll:,.2f}"
-        f"{event_bit}"
     )
-    print(f"\r{line:<170}", end="", flush=True)
+    print(f"\r{line:<150}", end="", flush=True)
 
 
-def _print_performance(stats: dict[str, Any]) -> None:
+def _print_performance(stats: dict[str, Any], *, kalshi_event: str = "") -> None:
     print()
     print("=" * 60)
     print("  PREDICTION MARKET — FINAL PERFORMANCE")
     print("=" * 60)
     print(f"  Time            : {_utcnow_label()}")
+    if kalshi_event:
+        print(f"  Last Kalshi mkt : {kalshi_event}")
     print(f"  Starting bank   : ${stats['starting_balance']:,.2f}")
     print(f"  Cash bankroll   : ${stats['usd_balance']:,.2f}")
     print(f"  Equity          : ${stats['equity']:,.2f}")
@@ -367,10 +366,9 @@ async def run_bot(
                 ):
                     print()
                     label = "Manual" if applied_source == "manual" else "Kalshi"
-                    extra = f" [{kalshi_event}]" if kalshi_event and applied_source == "kalshi" else ""
                     print(
                         f"[{_utcnow_label()}] {label} strike set to "
-                        f"${target_strike:,.2f}{extra}"
+                        f"${target_strike:,.2f}"
                     )
                     last_announced_strike = target_strike
 
@@ -405,13 +403,15 @@ async def run_bot(
                 edge=advice.edge,
                 bankroll=book.get_balance(),
                 market_prob=market_prob_above,
-                kalshi_event=kalshi_event,
             )
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
         await close_exchange(exchange)
-        _print_performance(book.get_performance_stats())
+        _print_performance(
+            book.get_performance_stats(),
+            kalshi_event=kalshi_event,
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
