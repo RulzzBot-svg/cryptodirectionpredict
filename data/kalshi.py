@@ -8,18 +8,34 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
 DEFAULT_SERIES = "KXBTC15M"
+_ET = ZoneInfo("America/New_York")
+_MONTHS = (
+    "JAN",
+    "FEB",
+    "MAR",
+    "APR",
+    "MAY",
+    "JUN",
+    "JUL",
+    "AUG",
+    "SEP",
+    "OCT",
+    "NOV",
+    "DEC",
+)
 
 
 @dataclass(frozen=True)
 class KalshiBtcWindow:
-    """Current (or nearest) Kalshi BTC 15m contract snapshot."""
+    """Current Kalshi BTC 15m contract snapshot."""
 
     ticker: str
     event_ticker: str
@@ -84,17 +100,51 @@ def _request_json(url: str, *, timeout: float = 15.0) -> dict[str, Any]:
         return json.load(resp)
 
 
-def fetch_markets(
+def window_bounds_et(now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """Return [start, end) of the current 15m window in US/Eastern."""
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    et = now_utc.astimezone(_ET)
+    minute = (et.minute // 15) * 15
+    start = et.replace(minute=minute, second=0, microsecond=0)
+    end = start + timedelta(minutes=15)
+    return start, end
+
+
+def expected_event_ticker(
     *,
     series_ticker: str = DEFAULT_SERIES,
+    now: Optional[datetime] = None,
+) -> str:
+    """
+    Build the Kalshi event ticker for the active window.
+
+    Example: KXBTC15M-26JUL231400
+    The trailing HHMM is the window END time in US/Eastern.
+    """
+    _, end_et = window_bounds_et(now)
+    suffix = (
+        f"{end_et.strftime('%y')}"
+        f"{_MONTHS[end_et.month - 1]}"
+        f"{end_et.strftime('%d%H%M')}"
+    )
+    return f"{series_ticker}-{suffix}"
+
+
+def fetch_markets(
+    *,
+    series_ticker: Optional[str] = DEFAULT_SERIES,
+    event_ticker: Optional[str] = None,
     status: Optional[str] = "open",
     limit: int = 20,
     base_url: str = DEFAULT_BASE_URL,
 ) -> list[dict[str, Any]]:
-    params: dict[str, str] = {
-        "series_ticker": series_ticker,
-        "limit": str(limit),
-    }
+    params: dict[str, str] = {"limit": str(limit)}
+    if event_ticker:
+        params["event_ticker"] = event_ticker
+    elif series_ticker:
+        params["series_ticker"] = series_ticker
     if status:
         params["status"] = status
     url = f"{base_url.rstrip('/')}/markets?{urllib.parse.urlencode(params)}"
@@ -118,6 +168,21 @@ def _from_market(market: dict[str, Any]) -> KalshiBtcWindow:
     )
 
 
+def _pick_active(markets: list[KalshiBtcWindow], now: datetime) -> Optional[KalshiBtcWindow]:
+    """Prefer the market whose [open, close) contains now and has a strike."""
+    timed = [
+        m
+        for m in markets
+        if m.open_time and m.close_time and m.open_time <= now < m.close_time
+    ]
+    with_strike = [m for m in timed if m.strike is not None]
+    if with_strike:
+        return with_strike[0]
+    if timed:
+        return timed[0]
+    return None
+
+
 def fetch_current_btc_15m(
     *,
     series_ticker: str = DEFAULT_SERIES,
@@ -125,46 +190,74 @@ def fetch_current_btc_15m(
     now: Optional[datetime] = None,
 ) -> Optional[KalshiBtcWindow]:
     """
-    Fetch the active Kalshi BTC 15m market (same family Robinhood shows).
+    Fetch the Kalshi BTC 15m market for the *current* ET window only.
 
-    Prefers ``status=open`` markets with a locked ``floor_strike``. Falls back to
-    the soonest initialized market if nothing is open yet.
+    Resolution order:
+      1. event_ticker for this window (e.g. KXBTC15M-26JUL231400)
+      2. status=open series markets whose open/close contain now
+    Never returns finalized/settled markets from older windows.
     """
     now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    event_ticker = expected_event_ticker(series_ticker=series_ticker, now=now)
+
+    # 1) Exact event for this 15m URL/window
+    try:
+        by_event = fetch_markets(
+            event_ticker=event_ticker,
+            status=None,
+            limit=10,
+            base_url=base_url,
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Kalshi event fetch failed (%s): %s", event_ticker, exc)
+        by_event = []
+
+    parsed_event = [_from_market(m) for m in by_event]
+    # Ignore finalized leftovers if API ever returns mixed
+    live_event = [
+        m
+        for m in parsed_event
+        if (m.status or "").lower() in {"active", "open", "initialized", ""}
+        or (m.open_time and m.close_time and m.open_time <= now < m.close_time)
+    ]
+    chosen = _pick_active(live_event or parsed_event, now)
+    if chosen is not None and chosen.strike is not None:
+        logger.info(
+            "Kalshi window %s strike=%s yes=%s/%s",
+            chosen.event_ticker,
+            chosen.strike,
+            chosen.yes_bid,
+            chosen.yes_ask,
+        )
+        return chosen
+    if chosen is not None:
+        # Window exists but strike still TBD
+        return chosen
+
+    # 2) Fallback: currently open markets in the series
     try:
         open_markets = fetch_markets(
             series_ticker=series_ticker, status="open", base_url=base_url
         )
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
         logger.warning("Kalshi open-market fetch failed: %s", exc)
-        open_markets = []
-
-    parsed = [_from_market(m) for m in open_markets]
-    with_strike = [m for m in parsed if m.strike is not None]
-    if with_strike:
-        # Prefer the market whose window contains now; else nearest close_time
-        active = [
-            m
-            for m in with_strike
-            if m.open_time and m.close_time and m.open_time <= now < m.close_time
-        ]
-        if active:
-            return active[0]
-        with_strike.sort(
-            key=lambda m: abs((m.close_time or now) - now).total_seconds()
-        )
-        return with_strike[0]
-
-    # Fallback: upcoming/recent markets (strike often still TBD before open)
-    try:
-        upcoming = fetch_markets(
-            series_ticker=series_ticker, status=None, limit=50, base_url=base_url
-        )
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-        logger.warning("Kalshi markets fetch failed: %s", exc)
         return None
 
-    parsed_all = [_from_market(m) for m in upcoming]
-    candidates = [m for m in parsed_all if m.open_time is not None]
-    candidates.sort(key=lambda m: abs((m.open_time or now) - now).total_seconds())
-    return candidates[0] if candidates else None
+    parsed_open = [_from_market(m) for m in open_markets]
+    chosen = _pick_active(parsed_open, now)
+    if chosen is not None:
+        return chosen
+
+    # If an open market exists but clock skew, take the only open one with a strike
+    with_strike = [m for m in parsed_open if m.strike is not None]
+    if len(with_strike) == 1:
+        return with_strike[0]
+    if with_strike:
+        with_strike.sort(key=lambda m: abs((m.close_time or now) - now).total_seconds())
+        return with_strike[0]
+
+    logger.warning("No active Kalshi BTC 15m market found for %s", event_ticker)
+    return None

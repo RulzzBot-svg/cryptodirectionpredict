@@ -102,8 +102,10 @@ def _print_status(
     edge: float,
     bankroll: float,
     market_prob: float,
+    kalshi_event: str = "",
 ) -> None:
     src = {"manual": "RH", "kalshi": "KL", "auto": "auto"}.get(strike_source, strike_source)
+    event_bit = f" | {kalshi_event}" if kalshi_event else ""
     line = (
         f"[{_utcnow_label()}] "
         f"BTC ${price:,.2f} | "
@@ -115,8 +117,9 @@ def _print_status(
         f"Edge {edge * 100:+5.1f}¢ | "
         f"{action:<5} | "
         f"Bank ${bankroll:,.2f}"
+        f"{event_bit}"
     )
-    print(f"\r{line:<150}", end="", flush=True)
+    print(f"\r{line:<170}", end="", flush=True)
 
 
 def _print_performance(stats: dict[str, Any]) -> None:
@@ -215,8 +218,8 @@ async def run_bot(
     print(f"  Database        : {settings.database_url}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
-    print("  Kalshi series KXBTC15M supplies strike + YES odds automatically.")
-    print("  Optional override: --strike / manual_strike.txt / market_cents.txt")
+    print("  Kalshi auto-selects the current ET window ticker")
+    print("  (e.g. KXBTC15M-26JUL231400). Manual files are ignored in this mode.")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -241,24 +244,36 @@ async def run_bot(
     exchange: Any = None
     consecutive_errors = 0
     last_announced_strike: Optional[float] = None
-    pending_manual_strike = initial_strike
+    pending_manual_strike = initial_strike  # CLI / env only
     kalshi_strike: Optional[float] = None
+    kalshi_event: str = ""
+    warned_stale_file = False
 
     try:
         exchange = create_rest_exchange(provider)
         while True:
-            # 1) Manual file overrides always win
-            file_strike = _read_number_file(STRIKE_FILE)
-            if file_strike is not None:
-                pending_manual_strike = file_strike
+            # Manual file overrides only when NOT using Kalshi auto mode
+            if not use_kalshi:
+                file_strike = _read_number_file(STRIKE_FILE)
+                if file_strike is not None:
+                    pending_manual_strike = file_strike
+                file_mkt = _read_number_file(MARKET_CENTS_FILE)
+                if file_mkt is not None:
+                    market_prob_above = _normalize_market_prob(file_mkt) or market_prob_above
+                    market_locked = True
+            elif not warned_stale_file and (
+                STRIKE_FILE.exists() or MARKET_CENTS_FILE.exists()
+            ):
+                print()
+                print(
+                    f"[{_utcnow_label()}] Ignoring {STRIKE_FILE.name}/"
+                    f"{MARKET_CENTS_FILE.name} while Kalshi auto mode is on. "
+                    f"Delete those files or pass --no-kalshi to use them."
+                )
+                warned_stale_file = True
 
-            file_mkt = _read_number_file(MARKET_CENTS_FILE)
-            if file_mkt is not None:
-                market_prob_above = _normalize_market_prob(file_mkt) or market_prob_above
-                market_locked = True
-
-            # 2) Kalshi public feed for strike + YES odds (same contracts as RH)
-            if use_kalshi and pending_manual_strike is None:
+            # Kalshi public feed: exact current ET window ticker (…-26JUL231400)
+            if use_kalshi:
                 try:
                     kalshi = await asyncio.to_thread(
                         fetch_current_btc_15m, series_ticker=KALSHI_SERIES
@@ -267,6 +282,7 @@ async def run_bot(
                     logger.warning("Kalshi fetch failed: %s", exc)
                     kalshi = None
                 if kalshi is not None:
+                    kalshi_event = kalshi.event_ticker or kalshi.ticker
                     if kalshi.strike is not None:
                         kalshi_strike = float(kalshi.strike)
                     if not market_locked and kalshi.market_prob_above is not None:
@@ -323,9 +339,12 @@ async def run_bot(
                     f"(strike ${float(expired.strike):,.2f})"
                 )
                 book.settle_window(expired, float(expired.settlement_price or price))
-                if not STRIKE_FILE.exists():
+                # CLI manual strike applies to one window unless re-passed
+                if initial_strike is None:
                     pending_manual_strike = None
                 last_announced_strike = None
+                kalshi_strike = None
+                kalshi_event = ""
 
             # Apply explicit overrides / Kalshi strike onto active window
             applied_source = None
@@ -347,9 +366,10 @@ async def run_bot(
                 ):
                     print()
                     label = "Manual" if applied_source == "manual" else "Kalshi"
+                    extra = f" [{kalshi_event}]" if kalshi_event and applied_source == "kalshi" else ""
                     print(
                         f"[{_utcnow_label()}] {label} strike set to "
-                        f"${target_strike:,.2f}"
+                        f"${target_strike:,.2f}{extra}"
                     )
                     last_announced_strike = target_strike
 
@@ -384,6 +404,7 @@ async def run_bot(
                 edge=advice.edge,
                 bankroll=book.get_balance(),
                 market_prob=market_prob_above,
+                kalshi_event=kalshi_event,
             )
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
