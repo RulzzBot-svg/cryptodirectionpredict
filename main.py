@@ -5,12 +5,13 @@ BTC 15-minute prediction-market edge bot.
 Estimates P(finish ABOVE strike) for each wall-clock 15m window, recommends
 ABOVE / BELOW / SKIP, and optionally papers the bet against a 50/50 book.
 
-Manual Robinhood strike override
---------------------------------
-Pass at start:
-  python main.py --strike 64737.27 --market-cents 55
+Manual / Kalshi strike sources
+------------------------------
+By default the bot pulls strike + YES price from Kalshi's public API
+(same BTC 15m contracts Robinhood shows).
 
-Or while running, in another terminal:
+Override manually if needed:
+  python main.py --strike 64737.27 --market-cents 55
   echo 64737.27 > manual_strike.txt
   echo 55 > market_cents.txt
 """
@@ -30,6 +31,7 @@ from dotenv import load_dotenv
 
 from config.settings import load_settings
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
+from data.kalshi import fetch_current_btc_15m
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
 from prediction.advisor import PredictionAdvisor
@@ -51,6 +53,9 @@ MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
 CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
 MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
+# kalshi (default) | manual | auto
+STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
+KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -97,7 +102,7 @@ def _print_status(
     bankroll: float,
     market_prob: float,
 ) -> None:
-    src = "RH" if strike_source == "manual" else "auto"
+    src = {"manual": "RH", "kalshi": "KL", "auto": "auto"}.get(strike_source, strike_source)
     line = (
         f"[{_utcnow_label()}] "
         f"BTC ${price:,.2f} | "
@@ -147,21 +152,25 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--strike",
         type=str,
         default=os.getenv("MANUAL_STRIKE"),
-        help="Robinhood/Kalshi strike for the current window (e.g. 64737.27)",
+        help="Manual strike override (e.g. 64737.27). Overrides Kalshi.",
     )
     parser.add_argument(
         "--market-cents",
         type=str,
-        default=os.getenv("MARKET_CENTS", os.getenv("MARKET_PROB_ABOVE")),
-        help="Robinhood YES price in cents (e.g. 55) or probability (e.g. 0.55)",
+        default=None,
+        help="Manual YES price in cents (e.g. 55). Overrides Kalshi.",
+    )
+    parser.add_argument(
+        "--no-kalshi",
+        action="store_true",
+        help="Disable Kalshi auto strike/odds (use candle open / manual only).",
     )
     return parser.parse_args(argv)
 
 
-def _normalize_market_prob(value: Optional[float]) -> float:
+def _normalize_market_prob(value: Optional[float]) -> Optional[float]:
     if value is None:
-        return float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
-    # Allow either 55 (cents) or 0.55 (probability)
+        return None
     if value > 1.0:
         return max(0.0, min(1.0, value / 100.0))
     return max(0.0, min(1.0, value))
@@ -170,12 +179,19 @@ def _normalize_market_prob(value: Optional[float]) -> float:
 async def run_bot(
     *,
     initial_strike: Optional[float] = None,
-    initial_market_prob: float = 0.50,
+    initial_market_prob: Optional[float] = None,
+    use_kalshi: bool = True,
 ) -> None:
     settings = load_settings()
     symbol = settings.symbol
     provider = settings.data_provider
-    market_prob_above = initial_market_prob
+    # Priority later: manual file > CLI > Kalshi > 0.50 default
+    market_prob_above = (
+        initial_market_prob
+        if initial_market_prob is not None
+        else float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
+    )
+    market_locked = initial_market_prob is not None
 
     print("=" * 60)
     print("  BTC 15m PREDICTION EDGE BOT")
@@ -185,20 +201,20 @@ async def run_bot(
     print(f"  Candle TF       : {TIMEFRAME}")
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
     print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢")
-    print(f"  Market YES      : {market_prob_above * 100:.1f}¢")
+    print(f"  Strike source   : {'kalshi' if use_kalshi else 'manual/auto'}")
+    print(f"  Market YES      : {market_prob_above * 100:.1f}¢ "
+          f"{'(manual)' if market_locked else '(will follow Kalshi)'}")
     print(f"  Contract        : ${CONTRACT_COST:.2f} → $1.00 payout")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
     else:
-        print("  Manual strike   : (auto — set with --strike or manual_strike.txt)")
-    print(f"  Strike file     : {STRIKE_FILE}")
-    print(f"  Market file     : {MARKET_CENTS_FILE}")
+        print("  Manual strike   : none (Kalshi/auto)")
     print(f"  Database        : {settings.database_url}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
-    print("  Tip: echo 64737.27 > manual_strike.txt   # Robinhood strike")
-    print("       echo 55 > market_cents.txt          # Robinhood YES cents")
+    print("  Kalshi series KXBTC15M supplies strike + YES odds automatically.")
+    print("  Optional override: --strike / manual_strike.txt / market_cents.txt")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -224,18 +240,35 @@ async def run_bot(
     consecutive_errors = 0
     last_announced_strike: Optional[float] = None
     pending_manual_strike = initial_strike
+    kalshi_strike: Optional[float] = None
 
     try:
         exchange = create_rest_exchange(provider)
         while True:
-            # Hot-reload overrides from files (edit anytime while bot runs)
+            # 1) Manual file overrides always win
             file_strike = _read_number_file(STRIKE_FILE)
             if file_strike is not None:
                 pending_manual_strike = file_strike
 
             file_mkt = _read_number_file(MARKET_CENTS_FILE)
             if file_mkt is not None:
-                market_prob_above = _normalize_market_prob(file_mkt)
+                market_prob_above = _normalize_market_prob(file_mkt) or market_prob_above
+                market_locked = True
+
+            # 2) Kalshi public feed for strike + YES odds (same contracts as RH)
+            if use_kalshi and pending_manual_strike is None:
+                try:
+                    kalshi = await asyncio.to_thread(
+                        fetch_current_btc_15m, series_ticker=KALSHI_SERIES
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Kalshi fetch failed: %s", exc)
+                    kalshi = None
+                if kalshi is not None:
+                    if kalshi.strike is not None:
+                        kalshi_strike = float(kalshi.strike)
+                    if not market_locked and kalshi.market_prob_above is not None:
+                        market_prob_above = float(kalshi.market_prob_above)
 
             try:
                 snapshot = await fetch_latest_snapshot(
@@ -277,7 +310,9 @@ async def run_bot(
                 except (TypeError, ValueError, KeyError):
                     strike_hint = None
 
-            window, expired = windows.update(price, strike_price=strike_hint)
+            # Prefer Kalshi strike as the lock price for new windows
+            lock_price = kalshi_strike or strike_hint
+            window, expired = windows.update(price, strike_price=lock_price)
             if expired is not None:
                 print()
                 print(
@@ -286,25 +321,35 @@ async def run_bot(
                     f"(strike ${float(expired.strike):,.2f})"
                 )
                 book.settle_window(expired, float(expired.settlement_price or price))
-                # Manual strike from CLI/env applies to the first window only unless
-                # manual_strike.txt keeps getting updated for later windows.
                 if not STRIKE_FILE.exists():
                     pending_manual_strike = None
                 last_announced_strike = None
 
+            # Apply explicit overrides / Kalshi strike onto active window
+            applied_source = None
+            target_strike = None
             if pending_manual_strike is not None:
-                changed = windows.apply_manual_strike(pending_manual_strike)
+                target_strike = pending_manual_strike
+                applied_source = "manual"
+            elif kalshi_strike is not None:
+                target_strike = kalshi_strike
+                applied_source = "kalshi"
+
+            if target_strike is not None:
+                changed = windows.apply_manual_strike(
+                    target_strike, source=applied_source or "manual"
+                )
                 if changed and (
                     last_announced_strike is None
-                    or abs(last_announced_strike - pending_manual_strike) > 1e-9
+                    or abs(last_announced_strike - target_strike) > 1e-9
                 ):
                     print()
+                    label = "Manual" if applied_source == "manual" else "Kalshi"
                     print(
-                        f"[{_utcnow_label()}] Manual strike set to "
-                        f"${pending_manual_strike:,.2f} "
-                        f"(Robinhood/Kalshi override)"
+                        f"[{_utcnow_label()}] {label} strike set to "
+                        f"${target_strike:,.2f}"
                     )
-                    last_announced_strike = pending_manual_strike
+                    last_announced_strike = target_strike
 
             if window.strike is None:
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
@@ -347,13 +392,19 @@ async def run_bot(
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     strike = _parse_number(args.strike) if args.strike else None
-    market_raw = _parse_number(args.market_cents) if args.market_cents else None
+    # Prefer explicit CLI; else env MARKET_CENTS if set
+    market_arg = args.market_cents
+    if market_arg is None:
+        market_arg = os.getenv("MARKET_CENTS")
+    market_raw = _parse_number(market_arg) if market_arg else None
     market_prob = _normalize_market_prob(market_raw)
+    use_kalshi = (STRIKE_SOURCE in {"kalshi", "auto"}) and not args.no_kalshi
     try:
         asyncio.run(
             run_bot(
                 initial_strike=strike,
                 initial_market_prob=market_prob,
+                use_kalshi=use_kalshi,
             )
         )
     except KeyboardInterrupt:

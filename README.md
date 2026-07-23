@@ -46,22 +46,25 @@ cp .env.example .env
 python main.py
 ```
 
-### Paste Robinhood strike (recommended)
+### Paste Robinhood strike (optional now)
 
-When Robinhood shows a target like `$64,737.27`:
+By default the bot **auto-pulls strike + YES odds from Kalshi** (`KXBTC15M`),
+which matches the Robinhood BTC 15m contracts.
+
+Manual override still works if needed:
 
 ```bash
 python main.py --strike 64737.27 --market-cents 55
 ```
 
-Or while the bot is already running, in a **second terminal**:
+Or while running:
 
 ```bash
 echo 64737.27 > manual_strike.txt
 echo 55 > market_cents.txt
 ```
 
-The live line will show `Strike $64,737.27 (RH)` once applied.
+Status line shows `(KL)` for Kalshi or `(RH)` for manual override.
 
 Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 

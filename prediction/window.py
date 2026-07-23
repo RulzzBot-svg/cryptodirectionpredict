@@ -153,8 +153,8 @@ class WindowManager:
 
         return self.current, expired
 
-    def apply_manual_strike(self, price: float) -> bool:
+    def apply_manual_strike(self, price: float, *, source: str = "manual") -> bool:
         """Override the active window strike. Returns True if it changed."""
         if self.current is None:
             return False
-        return self.current.set_strike(price, source="manual")
+        return self.current.set_strike(price, source=source)
