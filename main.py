@@ -50,7 +50,8 @@ logger = logging.getLogger("main")
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
-CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))
+CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))  # legacy unused
+STAKE_NOTIONAL = float(os.getenv("STAKE_NOTIONAL", "20"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
 MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
 # kalshi (default) | manual | auto
@@ -204,7 +205,8 @@ async def run_bot(
     print(f"  Strike source   : {'kalshi' if use_kalshi else 'manual/auto'}")
     print(f"  Market YES      : {market_prob_above * 100:.1f}¢ "
           f"{'(manual)' if market_locked else '(will follow Kalshi)'}")
-    print(f"  Contract        : ${CONTRACT_COST:.2f} → $1.00 payout")
+    print(f"  Stake notional  : ${STAKE_NOTIONAL:,.2f} face "
+          f"(pay share_price × {STAKE_NOTIONAL:g} contracts)")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
@@ -226,7 +228,7 @@ async def run_bot(
         session_factory,
         initial_balance=settings.paper_initial_balance,
         symbol=symbol,
-        contract_cost=CONTRACT_COST,
+        stake_notional=STAKE_NOTIONAL,
         engine=engine,
     )
     windows = WindowManager(window_minutes=15)
@@ -368,6 +370,7 @@ async def run_bot(
                     window,
                     advice,
                     market_prob_above=market_prob_above,
+                    stake_notional=STAKE_NOTIONAL,
                 )
 
             _print_status(

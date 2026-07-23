@@ -76,7 +76,8 @@ Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 | `DATA_PROVIDER` | `coinbase` | `coinbase` / `binance` |
 | `MIN_EDGE` | `0.08` | Minimum edge vs market before betting (8¢) |
 | `MARKET_PROB_ABOVE` | `0.50` | Reference YES price (set to live Kalshi/RH odds when available) |
-| `CONTRACT_COST` | `0.50` | Paper premium paid per contract |
+| `STAKE_NOTIONAL` | `20` | Face value bought per bet (20 contracts ⇒ pay `20 × share_price`) |
+| `CONTRACT_COST` | `0.50` | Legacy; ignored when using notional stake sizing |
 | `AUTO_BET` | `true` | Place paper bets automatically |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 
