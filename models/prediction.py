@@ -27,7 +27,7 @@ class PredictionBankroll(Base):
 
 
 class PredictionBet(Base):
-    """One paper above/below contract for a 15m window."""
+    """One paper above/below position for a 15m window."""
 
     __tablename__ = "prediction_bets"
 
@@ -41,8 +41,13 @@ class PredictionBet(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)  # ABOVE | BELOW
     strike: Mapped[float] = mapped_column(Float, nullable=False)
-    entry_price: Mapped[float] = mapped_column(Float, nullable=False)  # spot at entry
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)  # BTC spot at entry
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # Price paid per $1-payout contract share (e.g. 0.53 = 53¢)
+    contract_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.50)
+    # Total premium debited = quantity * contract_price
     contract_cost: Mapped[float] = mapped_column(Float, nullable=False)
+    # Total cash if side wins = quantity * 1.00
     payout: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     model_prob: Mapped[float] = mapped_column(Float, nullable=False)
     market_prob: Mapped[float] = mapped_column(Float, nullable=False)

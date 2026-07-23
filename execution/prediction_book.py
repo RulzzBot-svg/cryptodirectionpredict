@@ -17,9 +17,13 @@ from prediction.window import PredictionWindow
 
 class PredictionBook:
     """
-    Simulates buying ABOVE/BELOW contracts.
+    Simulates buying ABOVE/BELOW shares like Robinhood/Kalshi.
 
-    Default economics: pay ``contract_cost`` (e.g. $0.50) for a $1 payout if correct.
+    Economics (per window):
+      - Choose a face-value stake (e.g. $20 ⇒ 20 contracts that pay $1 each)
+      - Pay ``quantity * contract_price`` now (e.g. 20 × $0.53 = $10.60)
+      - If correct, receive ``quantity * $1`` (e.g. $20) ⇒ profit $9.40
+      - If wrong, lose the premium paid
     """
 
     def __init__(
@@ -28,8 +32,7 @@ class PredictionBook:
         *,
         initial_balance: Optional[float] = None,
         symbol: Optional[str] = None,
-        contract_cost: float = 0.50,
-        payout: float = 1.0,
+        stake_notional: float = 20.0,
         engine=None,
     ) -> None:
         settings = load_settings()
@@ -40,8 +43,7 @@ class PredictionBook:
             else settings.paper_initial_balance
         )
         self.symbol = symbol or settings.symbol
-        self.contract_cost = float(contract_cost)
-        self.payout = float(payout)
+        self.stake_notional = max(0.01, float(stake_notional))
         bind = getattr(session_factory, "kw", {}).get("bind")
         init_db(bind if bind is not None else engine)
         self._ensure_bankroll()
@@ -94,17 +96,36 @@ class PredictionBook:
                 )
             ).first()
 
+    @staticmethod
+    def _side_contract_price(side: str, market_prob_above: float) -> float:
+        raw = (
+            float(market_prob_above)
+            if side == "ABOVE"
+            else (1.0 - float(market_prob_above))
+        )
+        # Keep away from 0/1 so sizing stays defined
+        return min(0.99, max(0.01, raw))
+
     def place_bet(
         self,
         window: PredictionWindow,
         advice: Advice,
         *,
         market_prob_above: float = 0.50,
+        stake_notional: Optional[float] = None,
     ) -> Optional[PredictionBet]:
         if not advice.should_bet:
             return None
         if window.strike is None:
             return None
+
+        notional = float(stake_notional) if stake_notional is not None else self.stake_notional
+        notional = max(0.01, notional)
+        # Each contract pays $1 face → quantity equals notional dollars
+        quantity = notional
+        contract_price = self._side_contract_price(advice.action, market_prob_above)
+        total_cost = quantity * contract_price
+        total_payout = quantity * 1.0
 
         with self.session_factory() as session:
             existing = session.scalars(
@@ -121,21 +142,20 @@ class PredictionBook:
                 return None
 
             bankroll = self._get_bankroll(session)
-            if float(bankroll.usd_balance) < self.contract_cost:
-                self._log("Bet skipped | insufficient bankroll")
+            if float(bankroll.usd_balance) < total_cost:
+                self._log(
+                    f"Bet skipped | need ${total_cost:,.2f}, "
+                    f"have ${float(bankroll.usd_balance):,.2f}"
+                )
                 return None
 
-            bankroll.usd_balance = float(bankroll.usd_balance) - self.contract_cost
+            bankroll.usd_balance = float(bankroll.usd_balance) - total_cost
             bankroll.updated_at = datetime.now(timezone.utc)
 
             model_prob = (
                 advice.prob_above if advice.action == "ABOVE" else advice.prob_below
             )
-            market_prob = (
-                market_prob_above
-                if advice.action == "ABOVE"
-                else (1.0 - market_prob_above)
-            )
+            market_prob = contract_price
 
             bet = PredictionBet(
                 placed_at=datetime.now(timezone.utc),
@@ -146,8 +166,10 @@ class PredictionBook:
                 side=advice.action,
                 strike=float(window.strike),
                 entry_price=float(advice.estimate.spot),
-                contract_cost=self.contract_cost,
-                payout=self.payout,
+                quantity=quantity,
+                contract_price=contract_price,
+                contract_cost=total_cost,
+                payout=total_payout,
                 model_prob=float(model_prob),
                 market_prob=float(market_prob),
                 edge=float(advice.edge),
@@ -178,23 +200,20 @@ class PredictionBook:
             if bet is None:
                 return None
 
-            if final_price > float(bet.strike):
+            # Robinhood/Kalshi: YES if settlement >= strike (at or above)
+            if final_price >= float(bet.strike):
                 outcome = "ABOVE"
-            elif final_price < float(bet.strike):
-                outcome = "BELOW"
             else:
-                outcome = "PUSH"
+                outcome = "BELOW"
 
             bankroll = self._get_bankroll(session)
-            if outcome == "PUSH":
-                pnl = 0.0
-                bankroll.usd_balance = float(bankroll.usd_balance) + float(bet.contract_cost)
-                status = "PUSH"
-            elif outcome == bet.side:
+            if outcome == bet.side:
+                # Win: receive full $1 face value per contract
                 pnl = float(bet.payout) - float(bet.contract_cost)
                 bankroll.usd_balance = float(bankroll.usd_balance) + float(bet.payout)
                 status = "WON"
             else:
+                # Lose: premium already debited at entry
                 pnl = -float(bet.contract_cost)
                 status = "LOST"
 
@@ -220,7 +239,7 @@ class PredictionBook:
             realized = sum(float(b.pnl or 0.0) for b in settled)
             open_bets = [b for b in bets if b.status == "OPEN"]
             balance = float(bankroll.usd_balance)
-            # Open contracts still have capital at risk (premium already deducted)
+            # Mark open premiums back into equity (capital at risk)
             equity = balance + sum(float(b.contract_cost) for b in open_bets)
             starting = float(self.initial_balance)
             return {
@@ -251,20 +270,28 @@ class PredictionBook:
         print(f"\n[{self._timestamp()}] {message}")
 
     def _log_bet_placed(self, bet: PredictionBet, advice: Advice) -> None:
+        qty = float(bet.quantity)
+        px = float(bet.contract_price)
+        cost = float(bet.contract_cost)
+        payout = float(bet.payout)
+        profit_if_win = payout - cost
         print(
             "\n"
             + "=" * 60
             + f"\n  PREDICTION BET  |  {bet.side}"
-            + f"\n  Window       : {bet.window_id}"
-            + f"\n  Strike       : ${bet.strike:,.2f}"
-            + f"\n  Spot         : ${bet.entry_price:,.2f}"
-            + f"\n  Model prob   : {bet.model_prob * 100:.2f}%"
-            + f"\n  Fair cents   : YES {advice.fair_yes_cents:.1f}¢ / "
-            + f"NO {advice.fair_no_cents:.1f}¢"
-            + f"\n  Edge         : {bet.edge * 100:.1f}¢"
-            + f"\n  Cost / Pay   : ${bet.contract_cost:.2f} → ${bet.payout:.2f}"
-            + f"\n  Bankroll     : ${bet.usd_balance_after:,.2f}"
-            + f"\n  Reason       : {advice.reason}"
+            + f"\n  Window         : {bet.window_id}"
+            + f"\n  Strike         : ${bet.strike:,.2f}"
+            + f"\n  BTC spot       : ${bet.entry_price:,.2f}"
+            + f"\n  Model prob     : {bet.model_prob * 100:.2f}%"
+            + f"\n  Share price    : {px * 100:.1f}¢"
+            + f"\n  Contracts      : {qty:.2f}  (face ${payout:,.2f})"
+            + f"\n  You pay now    : ${cost:,.2f}"
+            + f"\n  If correct     : get ${payout:,.2f}  "
+            + f"(profit +${profit_if_win:,.2f})"
+            + f"\n  If wrong       : lose ${cost:,.2f}"
+            + f"\n  Edge           : {bet.edge * 100:.1f}¢"
+            + f"\n  Bankroll       : ${bet.usd_balance_after:,.2f}"
+            + f"\n  Reason         : {advice.reason}"
             + "\n"
             + "=" * 60
             + "\n"
@@ -277,12 +304,16 @@ class PredictionBook:
             "\n"
             + "=" * 60
             + f"\n  SETTLEMENT  |  {bet.status}  |  bet {bet.side}"
-            + f"\n  Window       : {bet.window_id}"
-            + f"\n  Strike       : ${bet.strike:,.2f}"
-            + f"\n  Final price  : ${float(bet.settlement_price):,.2f}"
-            + f"\n  Outcome      : {bet.outcome}"
-            + f"\n  P/L          : {pnl_txt}"
-            + f"\n  Bankroll     : ${float(bet.usd_balance_after):,.2f}"
+            + f"\n  Window         : {bet.window_id}"
+            + f"\n  Strike         : ${bet.strike:,.2f}"
+            + f"\n  Final price    : ${float(bet.settlement_price):,.2f}"
+            + f"\n  Outcome        : {bet.outcome}"
+            + f"\n  Contracts      : {float(bet.quantity):.2f} @ "
+            + f"{float(bet.contract_price) * 100:.1f}¢"
+            + f"\n  Paid / Face    : ${float(bet.contract_cost):,.2f} / "
+            + f"${float(bet.payout):,.2f}"
+            + f"\n  P/L            : {pnl_txt}"
+            + f"\n  Bankroll       : ${float(bet.usd_balance_after):,.2f}"
             + "\n"
             + "=" * 60
             + "\n"

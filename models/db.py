@@ -41,7 +41,7 @@ def create_session_factory(engine=None) -> sessionmaker[Session]:
 
 
 def init_db(engine=None) -> None:
-    """Create all tables."""
+    """Create all tables and apply lightweight SQLite column migrations."""
     # Import models so they register on Base.metadata
     from models import portfolio as _portfolio  # noqa: F401
     from models import prediction as _prediction  # noqa: F401
@@ -49,6 +49,35 @@ def init_db(engine=None) -> None:
 
     eng = engine or create_db_engine()
     Base.metadata.create_all(eng)
+    _migrate_sqlite_prediction_bets(eng)
+
+
+def _migrate_sqlite_prediction_bets(engine) -> None:
+    """Add newer columns to existing SQLite DBs without wiping history."""
+    url = str(engine.url)
+    if not url.startswith("sqlite"):
+        return
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(prediction_bets)")).fetchall()
+        if not rows:
+            return
+        names = {row[1] for row in rows}
+        if "quantity" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE prediction_bets "
+                    "ADD COLUMN quantity FLOAT NOT NULL DEFAULT 1.0"
+                )
+            )
+        if "contract_price" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE prediction_bets "
+                    "ADD COLUMN contract_price FLOAT NOT NULL DEFAULT 0.50"
+                )
+            )
 
 
 @contextmanager
