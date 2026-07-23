@@ -13,7 +13,7 @@ Every ~10 seconds the bot:
 3. Computes **P(finish ABOVE strike)** with a driftless lognormal model
 4. Compares that probability to a reference market price (default 50¢)
 5. Recommends **ABOVE**, **BELOW**, or **SKIP**
-6. Optionally papers a $0.50 → $1.00 contract when edge ≥ `MIN_EDGE`
+6. Optionally papers a position sized by `STAKE_NOTIONAL` when edge ≥ `MIN_EDGE`
 
 Live status line example:
 
@@ -96,8 +96,11 @@ Fair YES ≈ `prob_above * 100¢`, fair NO ≈ `prob_below * 100¢`.
 
 ## Paper contracts
 
-`execution/prediction_book.py` debits `CONTRACT_COST` when a side is taken and
-pays `$1` on a win (refund on push). One contract max per window.
+`execution/prediction_book.py` mirrors Robinhood/Kalshi share math:
+
+- `STAKE_NOTIONAL=20` ⇒ buy 20 contracts that each pay **$1** if correct
+- At 53¢ YES: pay `20 × $0.53 = $10.60` now
+- Win ⇒ receive `$20` (profit **+$9.40**); lose ⇒ forfeit the `$10.60`
 
 ## Legacy spot paper trader
 
