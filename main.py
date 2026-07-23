@@ -148,6 +148,28 @@ def _print_performance(stats: dict[str, Any], *, kalshi_event: str = "") -> None
     print("=" * 60)
 
 
+def _print_window_performance(stats: dict[str, Any]) -> None:
+    """Compact running scoreboard after each 15m window settles."""
+    total_pnl = float(stats["total_pnl"])
+    realized = float(stats["realized_pnl"])
+    total_txt = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
+    realized_txt = f"+${realized:,.2f}" if realized >= 0 else f"-${abs(realized):,.2f}"
+    if stats["win_count"] or stats["loss_count"]:
+        wr = (
+            f"{stats['win_rate_pct']:.1f}% "
+            f"({stats['win_count']}W/{stats['loss_count']}L/"
+            f"{stats['push_count']}P)"
+        )
+    else:
+        wr = "n/a (no settled bets yet)"
+    print("-" * 60)
+    print(
+        f"  WINDOW STATS | Total P/L {total_txt} | "
+        f"Realized P/L {realized_txt} | Win rate {wr}"
+    )
+    print("-" * 60)
+
+
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="BTC 15m prediction-market edge bot",
@@ -339,6 +361,7 @@ async def run_bot(
                     f"(strike ${float(expired.strike):,.2f})"
                 )
                 book.settle_window(expired, float(expired.settlement_price or price))
+                _print_window_performance(book.get_performance_stats())
                 # CLI manual strike applies to one window unless re-passed
                 if initial_strike is None:
                     pending_manual_strike = None
