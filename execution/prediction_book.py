@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import load_settings
@@ -19,11 +19,12 @@ class PredictionBook:
     """
     Simulates buying ABOVE/BELOW shares like Robinhood/Kalshi.
 
-    Economics (per window):
-      - Choose a face-value stake (e.g. $20 ⇒ 20 contracts that pay $1 each)
-      - Pay ``quantity * contract_price`` now (e.g. 20 × $0.53 = $10.60)
-      - If correct, receive ``quantity * $1`` (e.g. $20) ⇒ profit $9.40
-      - If wrong, lose the premium paid
+    Economics for face ``N`` contracts (each pays $1 if correct):
+      - YES ask 34¢ / NO ask 66¢, face $20 →
+          ABOVE: pay $6.80 now; win → receive $20 total
+                 (= $6.80 stake back + $13.20 profit); lose → lose $6.80
+          BELOW: pay $13.20 now; win → receive $20 total
+                 (= $13.20 stake back + $6.80 profit); lose → lose $13.20
     """
 
     def __init__(
@@ -32,7 +33,7 @@ class PredictionBook:
         *,
         initial_balance: Optional[float] = None,
         symbol: Optional[str] = None,
-        stake_notional: float = 20.0,
+        stake_notional: float = 5.0,
         engine=None,
     ) -> None:
         settings = load_settings()
@@ -73,6 +74,24 @@ class PredictionBook:
                 )
             return row
 
+    def reset_paper_history(self, *, balance: Optional[float] = None) -> None:
+        """Clear all paper bets and set bankroll (default: initial_balance)."""
+        target = float(self.initial_balance if balance is None else balance)
+        with self.session_factory() as session:
+            session.execute(delete(PredictionBet))
+            row = session.scalars(
+                select(PredictionBankroll).order_by(PredictionBankroll.id.asc())
+            ).first()
+            if row is None:
+                session.add(PredictionBankroll(usd_balance=target))
+            else:
+                row.usd_balance = target
+                row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        self._log(
+            f"Paper history reset | W/L 0-0 | bankroll ${target:,.2f}"
+        )
+
     def _get_bankroll(self, session: Session) -> PredictionBankroll:
         row = session.scalars(
             select(PredictionBankroll).order_by(PredictionBankroll.id.asc())
@@ -97,21 +116,21 @@ class PredictionBook:
             ).first()
 
     @staticmethod
-    def _side_contract_price(side: str, market_prob_above: float) -> float:
-        raw = (
-            float(market_prob_above)
-            if side == "ABOVE"
-            else (1.0 - float(market_prob_above))
-        )
-        # Keep away from 0/1 so sizing stays defined
-        return min(0.99, max(0.01, raw))
+    def _tradable_share_price(price: Optional[float]) -> Optional[float]:
+        if price is None:
+            return None
+        value = float(price)
+        if value < 0.02 or value > 0.98:
+            return None
+        return value
 
     def place_bet(
         self,
         window: PredictionWindow,
         advice: Advice,
         *,
-        market_prob_above: float = 0.50,
+        market_prob_above: Optional[float] = None,
+        contract_price: Optional[float] = None,
         stake_notional: Optional[float] = None,
     ) -> Optional[PredictionBet]:
         if not advice.should_bet:
@@ -119,13 +138,34 @@ class PredictionBook:
         if window.strike is None:
             return None
 
+        # Prefer explicit ask for the chosen side; never invent a 1¢ fill
+        if contract_price is not None:
+            share_price = self._tradable_share_price(contract_price)
+        elif advice.entry_share_price is not None:
+            share_price = self._tradable_share_price(advice.entry_share_price)
+        elif market_prob_above is not None:
+            raw = (
+                float(market_prob_above)
+                if advice.action == "ABOVE"
+                else (1.0 - float(market_prob_above))
+            )
+            share_price = self._tradable_share_price(raw)
+        else:
+            share_price = None
+
+        if share_price is None:
+            self._log(
+                "Bet skipped | no tradable share ask "
+                f"for {advice.action} (refusing empty/0¢/100¢ book)"
+            )
+            return None
+
         notional = float(stake_notional) if stake_notional is not None else self.stake_notional
         notional = max(0.01, notional)
         # Each contract pays $1 face → quantity equals notional dollars
         quantity = notional
-        contract_price = self._side_contract_price(advice.action, market_prob_above)
-        total_cost = quantity * contract_price
-        total_payout = quantity * 1.0
+        total_cost = quantity * share_price
+        total_payout = quantity * 1.0  # cash returned if correct (includes stake)
 
         with self.session_factory() as session:
             existing = session.scalars(
@@ -155,7 +195,6 @@ class PredictionBook:
             model_prob = (
                 advice.prob_above if advice.action == "ABOVE" else advice.prob_below
             )
-            market_prob = contract_price
 
             bet = PredictionBet(
                 placed_at=datetime.now(timezone.utc),
@@ -167,11 +206,11 @@ class PredictionBook:
                 strike=float(window.strike),
                 entry_price=float(advice.estimate.spot),
                 quantity=quantity,
-                contract_price=contract_price,
+                contract_price=share_price,
                 contract_cost=total_cost,
                 payout=total_payout,
                 model_prob=float(model_prob),
-                market_prob=float(market_prob),
+                market_prob=float(share_price),
                 edge=float(advice.edge),
                 status="OPEN",
                 usd_balance_after=float(bankroll.usd_balance),
@@ -208,12 +247,12 @@ class PredictionBook:
 
             bankroll = self._get_bankroll(session)
             if outcome == bet.side:
-                # Win: receive full $1 face value per contract
+                # Win: receive full $1 face value per contract (stake + profit)
                 pnl = float(bet.payout) - float(bet.contract_cost)
                 bankroll.usd_balance = float(bankroll.usd_balance) + float(bet.payout)
                 status = "WON"
             else:
-                # Lose: premium already debited at entry
+                # Lose: premium already debited at entry — you lose what you paid
                 pnl = -float(bet.contract_cost)
                 status = "LOST"
 
@@ -285,10 +324,10 @@ class PredictionBook:
             + f"\n  Model prob     : {bet.model_prob * 100:.2f}%"
             + f"\n  Share price    : {px * 100:.1f}¢"
             + f"\n  Contracts      : {qty:.2f}  (face ${payout:,.2f})"
-            + f"\n  You pay now    : ${cost:,.2f}"
-            + f"\n  If correct     : get ${payout:,.2f}  "
-            + f"(profit +${profit_if_win:,.2f})"
-            + f"\n  If wrong       : lose ${cost:,.2f}"
+            + f"\n  You pay now    : ${cost:,.2f}  (your stake)"
+            + f"\n  If correct     : receive ${payout:,.2f} total "
+            + f"(= ${cost:,.2f} stake back + ${profit_if_win:,.2f} profit)"
+            + f"\n  If wrong       : lose your ${cost:,.2f} stake"
             + f"\n  Edge           : {bet.edge * 100:.1f}¢"
             + f"\n  Bankroll       : ${bet.usd_balance_after:,.2f}"
             + f"\n  Reason         : {advice.reason}"
@@ -299,7 +338,15 @@ class PredictionBook:
 
     def _log_bet_settled(self, bet: PredictionBet) -> None:
         pnl = float(bet.pnl or 0.0)
-        pnl_txt = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+        cost = float(bet.contract_cost)
+        payout = float(bet.payout)
+        if bet.status == "WON":
+            pnl_txt = (
+                f"+${pnl:,.2f}  (received ${payout:,.2f} total = "
+                f"${cost:,.2f} stake + ${pnl:,.2f} profit)"
+            )
+        else:
+            pnl_txt = f"-${abs(pnl):,.2f}  (lost your ${cost:,.2f} stake)"
         print(
             "\n"
             + "=" * 60
@@ -310,8 +357,7 @@ class PredictionBook:
             + f"\n  Outcome        : {bet.outcome}"
             + f"\n  Contracts      : {float(bet.quantity):.2f} @ "
             + f"{float(bet.contract_price) * 100:.1f}¢"
-            + f"\n  Paid / Face    : ${float(bet.contract_cost):,.2f} / "
-            + f"${float(bet.payout):,.2f}"
+            + f"\n  Paid / Face    : ${cost:,.2f} / ${payout:,.2f}"
             + f"\n  P/L            : {pnl_txt}"
             + f"\n  Bankroll       : ${float(bet.usd_balance_after):,.2f}"
             + "\n"

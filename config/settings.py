@@ -24,7 +24,7 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
-        paper_initial_balance=float(os.getenv("PAPER_INITIAL_BALANCE", "10000")),
+        paper_initial_balance=float(os.getenv("PAPER_INITIAL_BALANCE", "100")),
         symbol=os.getenv("SYMBOL", "BTC/USD"),
         data_provider=os.getenv("DATA_PROVIDER", "coinbase").strip().lower(),
         database_url=os.getenv("DATABASE_URL", "sqlite:///./paper_trading.db"),
