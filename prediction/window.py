@@ -28,6 +28,7 @@ class PredictionWindow:
     end: datetime
     strike: Optional[float] = None
     opening_price: Optional[float] = None
+    strike_source: str = "auto"  # auto | manual
     settled: bool = False
     settlement_price: Optional[float] = None
     outcome: Optional[str] = None  # ABOVE | BELOW | PUSH
@@ -60,6 +61,22 @@ class PredictionWindow:
         if self.strike is None and price > 0:
             self.strike = float(price)
             self.opening_price = float(price)
+
+    def set_strike(self, price: float, *, source: str = "manual") -> bool:
+        """
+        Force-set / override the window strike (e.g. Robinhood BRTI target).
+
+        Returns True if the strike value changed.
+        """
+        if price <= 0:
+            raise ValueError("strike must be positive")
+        new_price = float(price)
+        changed = self.strike is None or abs(float(self.strike) - new_price) > 1e-9
+        self.strike = new_price
+        if self.opening_price is None:
+            self.opening_price = new_price
+        self.strike_source = source
+        return changed
 
     def settle(self, final_price: float) -> str:
         if self.strike is None:
@@ -135,3 +152,9 @@ class WindowManager:
             self.current.lock_strike(lock_px)
 
         return self.current, expired
+
+    def apply_manual_strike(self, price: float) -> bool:
+        """Override the active window strike. Returns True if it changed."""
+        if self.current is None:
+            return False
+        return self.current.set_strike(price, source="manual")

@@ -4,15 +4,26 @@ BTC 15-minute prediction-market edge bot.
 
 Estimates P(finish ABOVE strike) for each wall-clock 15m window, recommends
 ABOVE / BELOW / SKIP, and optionally papers the bet against a 50/50 book.
+
+Manual Robinhood strike override
+--------------------------------
+Pass at start:
+  python main.py --strike 64737.27 --market-cents 55
+
+Or while running, in another terminal:
+  echo 64737.27 > manual_strike.txt
+  echo 55 > market_cents.txt
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -30,7 +41,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-# Keep the live status line readable
 logging.getLogger("data.feed").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
@@ -38,10 +48,12 @@ logger = logging.getLogger("main")
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
-MARKET_PROB_ABOVE = float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
 CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
 MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
+
+STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
+MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
 
 
 def _utcnow_label() -> str:
@@ -53,29 +65,52 @@ def _fmt_mmss(seconds: float) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def _parse_number(raw: str) -> Optional[float]:
+    text = raw.strip().replace(",", "").replace("$", "").replace("¢", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _read_number_file(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    try:
+        return _parse_number(path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+
+
 def _print_status(
     *,
     price: float,
     strike: float,
+    strike_source: str,
     remaining: float,
     p_above: float,
     p_below: float,
     action: str,
     edge: float,
     bankroll: float,
+    market_prob: float,
 ) -> None:
+    src = "RH" if strike_source == "manual" else "auto"
     line = (
         f"[{_utcnow_label()}] "
         f"BTC ${price:,.2f} | "
-        f"Strike ${strike:,.2f} | "
+        f"Strike ${strike:,.2f} ({src}) | "
         f"T-{_fmt_mmss(remaining)} | "
         f"Above {p_above * 100:5.2f}% | "
         f"Below {p_below * 100:5.2f}% | "
+        f"Mkt {market_prob * 100:4.1f}¢ | "
         f"Edge {edge * 100:+5.1f}¢ | "
         f"{action:<5} | "
         f"Bank ${bankroll:,.2f}"
     )
-    print(f"\r{line:<140}", end="", flush=True)
+    print(f"\r{line:<150}", end="", flush=True)
 
 
 def _print_performance(stats: dict[str, Any]) -> None:
@@ -104,10 +139,43 @@ def _print_performance(stats: dict[str, Any]) -> None:
     print("=" * 60)
 
 
-async def run_bot() -> None:
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="BTC 15m prediction-market edge bot",
+    )
+    parser.add_argument(
+        "--strike",
+        type=str,
+        default=os.getenv("MANUAL_STRIKE"),
+        help="Robinhood/Kalshi strike for the current window (e.g. 64737.27)",
+    )
+    parser.add_argument(
+        "--market-cents",
+        type=str,
+        default=os.getenv("MARKET_CENTS", os.getenv("MARKET_PROB_ABOVE")),
+        help="Robinhood YES price in cents (e.g. 55) or probability (e.g. 0.55)",
+    )
+    return parser.parse_args(argv)
+
+
+def _normalize_market_prob(value: Optional[float]) -> float:
+    if value is None:
+        return float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
+    # Allow either 55 (cents) or 0.55 (probability)
+    if value > 1.0:
+        return max(0.0, min(1.0, value / 100.0))
+    return max(0.0, min(1.0, value))
+
+
+async def run_bot(
+    *,
+    initial_strike: Optional[float] = None,
+    initial_market_prob: float = 0.50,
+) -> None:
     settings = load_settings()
     symbol = settings.symbol
     provider = settings.data_provider
+    market_prob_above = initial_market_prob
 
     print("=" * 60)
     print("  BTC 15m PREDICTION EDGE BOT")
@@ -116,13 +184,21 @@ async def run_bot() -> None:
     print(f"  Provider        : {provider}")
     print(f"  Candle TF       : {TIMEFRAME}")
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
-    print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢ vs market {MARKET_PROB_ABOVE * 100:.0f}¢")
+    print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢")
+    print(f"  Market YES      : {market_prob_above * 100:.1f}¢")
     print(f"  Contract        : ${CONTRACT_COST:.2f} → $1.00 payout")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
+    if initial_strike:
+        print(f"  Manual strike   : ${initial_strike:,.2f}")
+    else:
+        print("  Manual strike   : (auto — set with --strike or manual_strike.txt)")
+    print(f"  Strike file     : {STRIKE_FILE}")
+    print(f"  Market file     : {MARKET_CENTS_FILE}")
     print(f"  Database        : {settings.database_url}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
-    print("  Reads: % chance BTC finishes ABOVE the window strike.")
+    print("  Tip: echo 64737.27 > manual_strike.txt   # Robinhood strike")
+    print("       echo 55 > market_cents.txt          # Robinhood YES cents")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -140,16 +216,27 @@ async def run_bot() -> None:
     windows = WindowManager(window_minutes=15)
     advisor = PredictionAdvisor(
         min_edge=MIN_EDGE,
-        market_prob_above=MARKET_PROB_ABOVE,
+        market_prob_above=market_prob_above,
         min_seconds_to_bet=MIN_SECONDS_TO_BET,
     )
 
     exchange: Any = None
     consecutive_errors = 0
+    last_announced_strike: Optional[float] = None
+    pending_manual_strike = initial_strike
 
     try:
         exchange = create_rest_exchange(provider)
         while True:
+            # Hot-reload overrides from files (edit anytime while bot runs)
+            file_strike = _read_number_file(STRIKE_FILE)
+            if file_strike is not None:
+                pending_manual_strike = file_strike
+
+            file_mkt = _read_number_file(MARKET_CENTS_FILE)
+            if file_mkt is not None:
+                market_prob_above = _normalize_market_prob(file_mkt)
+
             try:
                 snapshot = await fetch_latest_snapshot(
                     symbol,
@@ -199,6 +286,25 @@ async def run_bot() -> None:
                     f"(strike ${float(expired.strike):,.2f})"
                 )
                 book.settle_window(expired, float(expired.settlement_price or price))
+                # Manual strike from CLI/env applies to the first window only unless
+                # manual_strike.txt keeps getting updated for later windows.
+                if not STRIKE_FILE.exists():
+                    pending_manual_strike = None
+                last_announced_strike = None
+
+            if pending_manual_strike is not None:
+                changed = windows.apply_manual_strike(pending_manual_strike)
+                if changed and (
+                    last_announced_strike is None
+                    or abs(last_announced_strike - pending_manual_strike) > 1e-9
+                ):
+                    print()
+                    print(
+                        f"[{_utcnow_label()}] Manual strike set to "
+                        f"${pending_manual_strike:,.2f} "
+                        f"(Robinhood/Kalshi override)"
+                    )
+                    last_announced_strike = pending_manual_strike
 
             if window.strike is None:
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
@@ -208,7 +314,7 @@ async def run_bot() -> None:
                 window,
                 price,
                 snapshot["candles"],
-                market_prob_above=MARKET_PROB_ABOVE,
+                market_prob_above=market_prob_above,
             )
 
             if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
@@ -216,35 +322,40 @@ async def run_bot() -> None:
                 book.place_bet(
                     window,
                     advice,
-                    market_prob_above=MARKET_PROB_ABOVE,
+                    market_prob_above=market_prob_above,
                 )
 
             _print_status(
                 price=price,
                 strike=float(window.strike),
+                strike_source=getattr(window, "strike_source", "auto"),
                 remaining=window.seconds_remaining(),
                 p_above=advice.prob_above,
                 p_below=advice.prob_below,
                 action=advice.action,
                 edge=advice.edge,
                 bankroll=book.get_balance(),
+                market_prob=market_prob_above,
             )
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
-        # Settle the active window mark-to-market if a bet is open
-        if windows.current is not None and windows.current.strike is not None:
-            open_bet = book.get_open_bet(windows.current.window_id)
-            # leave OPEN bets open on shutdown (capital already deducted);
-            # performance equity credits premium back.
-            _ = open_bet
         await close_exchange(exchange)
         _print_performance(book.get_performance_stats())
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
+    strike = _parse_number(args.strike) if args.strike else None
+    market_raw = _parse_number(args.market_cents) if args.market_cents else None
+    market_prob = _normalize_market_prob(market_raw)
     try:
-        asyncio.run(run_bot())
+        asyncio.run(
+            run_bot(
+                initial_strike=strike,
+                initial_market_prob=market_prob,
+            )
+        )
     except KeyboardInterrupt:
         print()
         return 0

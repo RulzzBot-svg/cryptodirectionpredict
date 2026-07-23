@@ -46,6 +46,23 @@ cp .env.example .env
 python main.py
 ```
 
+### Paste Robinhood strike (recommended)
+
+When Robinhood shows a target like `$64,737.27`:
+
+```bash
+python main.py --strike 64737.27 --market-cents 55
+```
+
+Or while the bot is already running, in a **second terminal**:
+
+```bash
+echo 64737.27 > manual_strike.txt
+echo 55 > market_cents.txt
+```
+
+The live line will show `Strike $64,737.27 (RH)` once applied.
+
 Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 
 ### Useful env vars

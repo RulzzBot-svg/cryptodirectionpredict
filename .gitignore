@@ -19,6 +19,8 @@ logs/*
 *.log
 paper_trading.db
 *.db
+manual_strike.txt
+market_cents.txt
 
 # IDE / OS
 .idea/
