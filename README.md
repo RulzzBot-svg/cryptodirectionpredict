@@ -48,10 +48,12 @@ python main.py
 
 ### Paste Robinhood strike (optional now)
 
-By default the bot **auto-pulls strike + YES odds from Kalshi** (`KXBTC15M`),
-which matches the Robinhood BTC 15m contracts.
+By default the bot **auto-pulls the current Kalshi window** by event ticker
+(e.g. `KXBTC15M-26JUL231400` — the suffix is the window end time in ET), then
+reads `floor_strike` + YES odds. This matches the Robinhood BTC 15m contracts.
 
-Manual override still works if needed:
+Status shows `(KL)` plus the event ticker. Stale `manual_strike.txt` files are
+**ignored** while Kalshi auto mode is on.
 
 ```bash
 python main.py --strike 64737.27 --market-cents 55
