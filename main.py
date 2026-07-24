@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.settings import load_settings
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
 from data.kalshi import fetch_current_btc_15m
@@ -38,13 +39,6 @@ from prediction.advisor import PredictionAdvisor
 from prediction.window import WindowManager
 
 load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logging.getLogger("data.feed").setLevel(logging.WARNING)
-logging.getLogger("data.kalshi").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 
@@ -266,11 +260,13 @@ async def run_bot(
     else:
         print("  Manual strike   : none (Kalshi/auto)")
     print(f"  Database        : {settings.database_url}")
+    print(f"  Log file        : {os.getenv('_BOT_LOG_PATH', 'logs/bot.log')}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
     print("  Kalshi auto-selects the current ET window ticker")
     print("  (e.g. KXBTC15M-26JUL231400). Manual files are ignored in this mode.")
     print("  Win: receive full face (= stake back + profit). Lose: lose stake paid.")
+    print("  All terminal output is appended to the log file.")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -482,6 +478,11 @@ async def run_bot(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    log_path = setup_bot_logging()
+    os.environ["_BOT_LOG_PATH"] = str(log_path.resolve())
+    logging.getLogger("data.feed").setLevel(logging.WARNING)
+    logging.getLogger("data.kalshi").setLevel(logging.WARNING)
+
     args = _parse_args(argv)
     strike = _parse_number(args.strike) if args.strike else None
     # Prefer explicit CLI; else env MARKET_CENTS if set
@@ -503,6 +504,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         print()
         return 0
+    finally:
+        shutdown_bot_logging()
     return 0
 
 

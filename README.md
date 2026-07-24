@@ -72,6 +72,10 @@ Status line shows `(KL)` for Kalshi or `(RH)` for manual override.
 
 Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 
+Terminal output (status ticks, bets, settlements) is also appended to
+`logs/bot.log` (rotates when large). Bets themselves still live in
+`paper_trading.db`.
+
 ### Useful env vars
 
 | Variable | Default | Meaning |
@@ -85,6 +89,7 @@ Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 | `CONTRACT_COST` | `0.50` | Legacy; ignored when using notional stake sizing |
 | `AUTO_BET` | `true` | Place paper bets automatically |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
+| `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 
 > **Note:** Cursor Cloud / some VPS regions get HTTP 451 from Binance. Prefer Coinbase (`BTC/USD`) or Kraken there.
 
