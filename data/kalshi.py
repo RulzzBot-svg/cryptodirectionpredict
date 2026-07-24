@@ -44,24 +44,63 @@ class KalshiBtcWindow:
     yes_bid: Optional[float]
     yes_ask: Optional[float]
     yes_last: Optional[float]
+    no_bid: Optional[float]
+    no_ask: Optional[float]
     open_time: Optional[datetime]
     close_time: Optional[datetime]
     status: str
     raw: dict[str, Any]
 
+    @staticmethod
+    def _valid_quote(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        price = float(value)
+        # 0.0 from Kalshi usually means "no book yet", not a real 0¢ market
+        if price <= 0.0 or price >= 1.0:
+            return None
+        return price
+
     @property
     def yes_mid(self) -> Optional[float]:
-        if self.yes_bid is not None and self.yes_ask is not None:
-            return (self.yes_bid + self.yes_ask) / 2.0
-        return self.yes_ask or self.yes_last or self.yes_bid
+        bid = self._valid_quote(self.yes_bid)
+        ask = self._valid_quote(self.yes_ask)
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+        return ask or self._valid_quote(self.yes_last) or bid
+
+    @property
+    def buy_yes_price(self) -> Optional[float]:
+        """Price to buy ABOVE/YES shares — ask only (no last/mid fallback)."""
+        return self._valid_quote(self.yes_ask)
+
+    @property
+    def buy_no_price(self) -> Optional[float]:
+        """Price to buy BELOW/NO shares — ask only, else complement of YES bid."""
+        no_ask = self._valid_quote(self.no_ask)
+        if no_ask is not None:
+            return no_ask
+        # Buying NO ≈ hitting the YES bid complement when NO ask is absent
+        yes_bid = self._valid_quote(self.yes_bid)
+        if yes_bid is None:
+            return None
+        return max(0.01, min(0.99, 1.0 - yes_bid))
 
     @property
     def market_prob_above(self) -> Optional[float]:
-        """Implied P(above) from Kalshi YES price in [0, 1]."""
-        mid = self.yes_mid
-        if mid is None:
-            return None
-        return max(0.0, min(1.0, float(mid)))
+        """Implied P(above) from a tradable YES ask (else mid for display)."""
+        return self.buy_yes_price or self.yes_mid
+
+    @property
+    def quotes_tradable(self) -> bool:
+        yes = self.buy_yes_price
+        no = self.buy_no_price
+        return (
+            yes is not None
+            and no is not None
+            and 0.02 <= yes <= 0.98
+            and 0.02 <= no <= 0.98
+        )
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -152,15 +191,42 @@ def fetch_markets(
     return list(payload.get("markets") or [])
 
 
+def _quote_dollars(market: dict[str, Any], *keys: str) -> Optional[float]:
+    """Read the first present money field (dollars preferred, else cents/100)."""
+    for key in keys:
+        if key not in market or market.get(key) is None:
+            continue
+        raw = market.get(key)
+        value = _parse_float(raw)
+        if value is None:
+            continue
+        # Integer-ish cent fields (e.g. yes_bid=34) → dollars
+        if "dollars" not in key and value > 1.0:
+            value = value / 100.0
+        return value
+    return None
+
+
 def _from_market(market: dict[str, Any]) -> KalshiBtcWindow:
+    yes_bid = _quote_dollars(market, "yes_bid_dollars", "yes_bid")
+    yes_ask = _quote_dollars(market, "yes_ask_dollars", "yes_ask")
+    no_bid = _quote_dollars(market, "no_bid_dollars", "no_bid")
+    no_ask = _quote_dollars(market, "no_ask_dollars", "no_ask")
+    # Derive complementary NO book when Kalshi only publishes YES
+    if no_ask is None and yes_bid is not None and 0.0 < yes_bid < 1.0:
+        no_ask = 1.0 - yes_bid
+    if no_bid is None and yes_ask is not None and 0.0 < yes_ask < 1.0:
+        no_bid = 1.0 - yes_ask
     return KalshiBtcWindow(
         ticker=str(market.get("ticker") or ""),
         event_ticker=str(market.get("event_ticker") or ""),
         title=str(market.get("title") or market.get("yes_sub_title") or ""),
         strike=_parse_float(market.get("floor_strike")),
-        yes_bid=_parse_float(market.get("yes_bid_dollars")),
-        yes_ask=_parse_float(market.get("yes_ask_dollars")),
-        yes_last=_parse_float(market.get("last_price_dollars")),
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        yes_last=_quote_dollars(market, "last_price_dollars", "last_price"),
+        no_bid=no_bid,
+        no_ask=no_ask,
         open_time=_parse_dt(market.get("open_time")),
         close_time=_parse_dt(market.get("close_time")),
         status=str(market.get("status") or ""),

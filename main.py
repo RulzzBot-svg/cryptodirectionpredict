@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.settings import load_settings
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
 from data.kalshi import fetch_current_btc_15m
@@ -39,22 +40,21 @@ from prediction.window import WindowManager
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logging.getLogger("data.feed").setLevel(logging.WARNING)
-logging.getLogger("data.kalshi").setLevel(logging.WARNING)
-
 logger = logging.getLogger("main")
 
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
 CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))  # legacy unused
-STAKE_NOTIONAL = float(os.getenv("STAKE_NOTIONAL", "20"))
+STAKE_NOTIONAL = float(os.getenv("STAKE_NOTIONAL", "5"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
 MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
+RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 # kalshi (default) | manual | auto
 STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -191,15 +191,23 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable Kalshi auto strike/odds (use candle open / manual only).",
     )
+    parser.add_argument(
+        "--reset-paper",
+        action="store_true",
+        help="Clear paper W/L history and reset bankroll before starting.",
+    )
     return parser.parse_args(argv)
 
 
 def _normalize_market_prob(value: Optional[float]) -> Optional[float]:
+    """Normalize cents or dollars; treat 0/1 as missing (empty book)."""
     if value is None:
         return None
     if value > 1.0:
-        return max(0.0, min(1.0, value / 100.0))
-    return max(0.0, min(1.0, value))
+        value = value / 100.0
+    if value <= 0.0 or value >= 1.0:
+        return None
+    return float(value)
 
 
 async def run_bot(
@@ -207,17 +215,23 @@ async def run_bot(
     initial_strike: Optional[float] = None,
     initial_market_prob: Optional[float] = None,
     use_kalshi: bool = True,
+    reset_paper: bool = False,
 ) -> None:
     settings = load_settings()
     symbol = settings.symbol
     provider = settings.data_provider
     # Priority later: manual file > CLI > Kalshi > 0.50 default
+    fallback_mkt = _normalize_market_prob(
+        float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
+    ) or 0.50
     market_prob_above = (
-        initial_market_prob
-        if initial_market_prob is not None
-        else float(os.getenv("MARKET_PROB_ABOVE", "0.50"))
+        initial_market_prob if initial_market_prob is not None else fallback_mkt
     )
     market_locked = initial_market_prob is not None
+    yes_ask: Optional[float] = market_prob_above if market_locked else None
+    no_ask: Optional[float] = (
+        (1.0 - market_prob_above) if market_locked else None
+    )
 
     print("=" * 60)
     print("  BTC 15m PREDICTION EDGE BOT")
@@ -228,20 +242,31 @@ async def run_bot(
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
     print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢")
     print(f"  Strike source   : {'kalshi' if use_kalshi else 'manual/auto'}")
-    print(f"  Market YES      : {market_prob_above * 100:.1f}¢ "
-          f"{'(manual)' if market_locked else '(will follow Kalshi)'}")
-    print(f"  Stake notional  : ${STAKE_NOTIONAL:,.2f} face "
-          f"(pay share_price × {STAKE_NOTIONAL:g} contracts)")
+    if market_locked:
+        print(
+            f"  Market YES/NO   : {market_prob_above * 100:.1f}¢ / "
+            f"{(1.0 - market_prob_above) * 100:.1f}¢ (manual)"
+        )
+    else:
+        print("  Market YES/NO   : live Kalshi asks (skip if empty/0¢)")
+    print(
+        f"  Stake notional  : ${STAKE_NOTIONAL:,.2f} face "
+        f"(pay share_price × {STAKE_NOTIONAL:g} contracts)"
+    )
+    print(f"  Starting bank   : ${settings.paper_initial_balance:,.2f}")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
     else:
         print("  Manual strike   : none (Kalshi/auto)")
     print(f"  Database        : {settings.database_url}")
+    print(f"  Log file        : {os.getenv('_BOT_LOG_PATH', 'logs/bot.log')}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
     print("  Kalshi auto-selects the current ET window ticker")
     print("  (e.g. KXBTC15M-26JUL231400). Manual files are ignored in this mode.")
+    print("  Win: receive full face (= stake back + profit). Lose: lose stake paid.")
+    print("  All terminal output is appended to the log file.")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -256,6 +281,8 @@ async def run_bot(
         stake_notional=STAKE_NOTIONAL,
         engine=engine,
     )
+    if reset_paper or RESET_PAPER_HISTORY:
+        book.reset_paper_history(balance=settings.paper_initial_balance)
     windows = WindowManager(window_minutes=15)
     advisor = PredictionAdvisor(
         min_edge=MIN_EDGE,
@@ -281,8 +308,12 @@ async def run_bot(
                     pending_manual_strike = file_strike
                 file_mkt = _read_number_file(MARKET_CENTS_FILE)
                 if file_mkt is not None:
-                    market_prob_above = _normalize_market_prob(file_mkt) or market_prob_above
-                    market_locked = True
+                    normalized = _normalize_market_prob(file_mkt)
+                    if normalized is not None:
+                        market_prob_above = normalized
+                        yes_ask = normalized
+                        no_ask = 1.0 - normalized
+                        market_locked = True
             elif not warned_stale_file and (
                 STRIKE_FILE.exists() or MARKET_CENTS_FILE.exists()
             ):
@@ -307,8 +338,11 @@ async def run_bot(
                     kalshi_event = kalshi.event_ticker or kalshi.ticker
                     if kalshi.strike is not None:
                         kalshi_strike = float(kalshi.strike)
-                    if not market_locked and kalshi.market_prob_above is not None:
-                        market_prob_above = float(kalshi.market_prob_above)
+                    if not market_locked:
+                        yes_ask = kalshi.buy_yes_price
+                        no_ask = kalshi.buy_no_price
+                        if yes_ask is not None:
+                            market_prob_above = float(yes_ask)
 
             try:
                 snapshot = await fetch_latest_snapshot(
@@ -368,6 +402,9 @@ async def run_bot(
                 last_announced_strike = None
                 kalshi_strike = None
                 kalshi_event = ""
+                if not market_locked:
+                    yes_ask = None
+                    no_ask = None
 
             # Apply explicit overrides / Kalshi strike onto active window
             applied_source = None
@@ -404,6 +441,8 @@ async def run_bot(
                 price,
                 snapshot["candles"],
                 market_prob_above=market_prob_above,
+                yes_ask=yes_ask,
+                no_ask=no_ask,
             )
 
             if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
@@ -411,10 +450,11 @@ async def run_bot(
                 book.place_bet(
                     window,
                     advice,
-                    market_prob_above=market_prob_above,
+                    contract_price=advice.entry_share_price,
                     stake_notional=STAKE_NOTIONAL,
                 )
 
+            status_mkt = yes_ask if yes_ask is not None else market_prob_above
             _print_status(
                 price=price,
                 strike=float(window.strike),
@@ -425,7 +465,7 @@ async def run_bot(
                 action=advice.action,
                 edge=advice.edge,
                 bankroll=book.get_balance(),
-                market_prob=market_prob_above,
+                market_prob=status_mkt if status_mkt is not None else 0.0,
             )
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
@@ -438,6 +478,11 @@ async def run_bot(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    log_path = setup_bot_logging()
+    os.environ["_BOT_LOG_PATH"] = str(log_path.resolve())
+    logging.getLogger("data.feed").setLevel(logging.WARNING)
+    logging.getLogger("data.kalshi").setLevel(logging.WARNING)
+
     args = _parse_args(argv)
     strike = _parse_number(args.strike) if args.strike else None
     # Prefer explicit CLI; else env MARKET_CENTS if set
@@ -453,11 +498,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 initial_strike=strike,
                 initial_market_prob=market_prob,
                 use_kalshi=use_kalshi,
+                reset_paper=bool(args.reset_paper),
             )
         )
     except KeyboardInterrupt:
         print()
         return 0
+    finally:
+        shutdown_bot_logging()
     return 0
 
 

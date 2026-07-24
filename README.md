@@ -18,7 +18,7 @@ Every ~10 seconds the bot:
 Live status line example:
 
 ```text
-BTC $65,914.06 | Strike $65,900.00 | T-08:42 | Above 57.20% | Below 42.80% | Edge +7.2¢ | SKIP  | Bank $10,000.00
+BTC $65,914.06 | Strike $65,900.00 | T-08:42 | Above 57.20% | Below 42.80% | Mkt 53.0¢ | Edge +4.2¢ | SKIP  | Bank $100.00
 ```
 
 ## Project Structure
@@ -26,7 +26,7 @@ BTC $65,914.06 | Strike $65,900.00 | T-08:42 | Above 57.20% | Below 42.80% | Edg
 ```
 .
 ├── config/              # Settings / env loading
-├── data/                # CCXT market data feed
+├── data/                # CCXT market data + Kalshi public feed
 ├── prediction/          # Windowing, probability, advisor
 ├── models/              # SQLAlchemy schemas
 ├── strategies/          # Legacy EMA spot strategy (optional)
@@ -43,6 +43,7 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
+python main.py --reset-paper       # wipe W/L and start bank at $100
 python main.py
 ```
 
@@ -50,10 +51,10 @@ python main.py
 
 By default the bot **auto-pulls the current Kalshi window** by event ticker
 (e.g. `KXBTC15M-26JUL231400` — the suffix is the window end time in ET), then
-reads `floor_strike` + YES odds. This matches the Robinhood BTC 15m contracts.
+reads `floor_strike` + YES/NO asks. This matches the Robinhood BTC 15m contracts.
 
 Status shows `(KL)` plus the event ticker. Stale `manual_strike.txt` files are
-**ignored** while Kalshi auto mode is on.
+**ignored** while Kalshi auto mode is on. Empty/0¢ books are skipped (no fake 1¢ fills).
 
 ```bash
 python main.py --strike 64737.27 --market-cents 55
@@ -64,11 +65,16 @@ Or while running:
 ```bash
 echo 64737.27 > manual_strike.txt
 echo 55 > market_cents.txt
+python main.py --no-kalshi
 ```
 
 Status line shows `(KL)` for Kalshi or `(RH)` for manual override.
 
 Ctrl+C prints settlement / bankroll performance and closes the exchange client.
+
+Terminal output (status ticks, bets, settlements) is also appended to
+`logs/bot.log` (rotates when large). Bets themselves still live in
+`paper_trading.db`.
 
 ### Useful env vars
 
@@ -76,12 +82,14 @@ Ctrl+C prints settlement / bankroll performance and closes the exchange client.
 |----------|---------|---------|
 | `SYMBOL` | `BTC/USD` | CCXT symbol |
 | `DATA_PROVIDER` | `coinbase` | `coinbase` / `binance` |
-| `MIN_EDGE` | `0.08` | Minimum edge vs market before betting (8¢) |
-| `MARKET_PROB_ABOVE` | `0.50` | Reference YES price (set to live Kalshi/RH odds when available) |
-| `STAKE_NOTIONAL` | `20` | Face value bought per bet (20 contracts ⇒ pay `20 × share_price`) |
+| `PAPER_INITIAL_BALANCE` | `100` | Starting paper bankroll ($) |
+| `MIN_EDGE` | `0.08` | Minimum edge vs ask before betting (8¢) |
+| `MARKET_PROB_ABOVE` | `0.50` | Fallback YES ask if Kalshi quotes missing |
+| `STAKE_NOTIONAL` | `5` | Face value per bet (5 contracts ⇒ pay `5 × share_price`) |
 | `CONTRACT_COST` | `0.50` | Legacy; ignored when using notional stake sizing |
 | `AUTO_BET` | `true` | Place paper bets automatically |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
+| `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 
 > **Note:** Cursor Cloud / some VPS regions get HTTP 451 from Binance. Prefer Coinbase (`BTC/USD`) or Kraken there.
 
@@ -98,11 +106,23 @@ Fair YES ≈ `prob_above * 100¢`, fair NO ≈ `prob_below * 100¢`.
 
 ## Paper contracts
 
-`execution/prediction_book.py` mirrors Robinhood/Kalshi share math:
+`execution/prediction_book.py` mirrors Robinhood/Kalshi share math.
 
-- `STAKE_NOTIONAL=20` ⇒ buy 20 contracts that each pay **$1** if correct
-- At 53¢ YES: pay `20 × $0.53 = $10.60` now
-- Win ⇒ receive `$20` (profit **+$9.40**); lose ⇒ forfeit the `$10.60`
+Example: YES **34¢** / NO **66¢**, face **$20** (20 contracts):
+
+| Side | You pay now | If correct | If wrong |
+|------|-------------|------------|----------|
+| YES/ABOVE | `$6.80` | receive `$20` total (= `$6.80` stake back + `$13.20` profit) | lose `$6.80` stake |
+| NO/BELOW | `$13.20` | receive `$20` total (= `$13.20` stake back + `$6.80` profit) | lose `$13.20` stake |
+
+Default sizing is `STAKE_NOTIONAL=5` (same math at $5 face).
+
+Reset paper W/L anytime:
+
+```bash
+python main.py --reset-paper
+# or RESET_PAPER_HISTORY=true in .env for one run
+```
 
 ## Legacy spot paper trader
 
