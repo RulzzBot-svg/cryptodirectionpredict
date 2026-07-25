@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +14,20 @@ from models.db import create_db_engine, create_session_factory, init_db
 from models.prediction import PredictionBankroll, PredictionBet
 from prediction.advisor import Advice
 from prediction.window import PredictionWindow
+
+
+@dataclass(frozen=True)
+class VaultWithdrawal:
+    """One (or stacked) paper withdrawal into the vault."""
+
+    amount: float
+    balance_before: float
+    balance_after: float
+    vaulted_after: float
+    working_bank: float
+    trigger_profit: float
+    vault_goal: float
+    goal_reached: bool
 
 
 class PredictionBook:
@@ -34,6 +49,11 @@ class PredictionBook:
         initial_balance: Optional[float] = None,
         symbol: Optional[str] = None,
         stake_notional: float = 5.0,
+        vault_enabled: bool = True,
+        vault_working_bank: Optional[float] = None,
+        vault_trigger_profit: float = 55.0,
+        vault_withdraw_amount: float = 50.0,
+        vault_goal: float = 300.0,
         engine=None,
     ) -> None:
         settings = load_settings()
@@ -45,6 +65,13 @@ class PredictionBook:
         )
         self.symbol = symbol or settings.symbol
         self.stake_notional = max(0.01, float(stake_notional))
+        self.vault_enabled = bool(vault_enabled)
+        self.vault_working_bank = float(
+            self.initial_balance if vault_working_bank is None else vault_working_bank
+        )
+        self.vault_trigger_profit = max(0.0, float(vault_trigger_profit))
+        self.vault_withdraw_amount = max(0.01, float(vault_withdraw_amount))
+        self.vault_goal = max(0.0, float(vault_goal))
         bind = getattr(session_factory, "kw", {}).get("bind")
         init_db(bind if bind is not None else engine)
         self._ensure_bankroll()
@@ -65,7 +92,7 @@ class PredictionBook:
                 select(PredictionBankroll).order_by(PredictionBankroll.id.asc())
             ).first()
             if row is None:
-                row = PredictionBankroll(usd_balance=self.initial_balance)
+                row = PredictionBankroll(usd_balance=self.initial_balance, vaulted_usd=0.0)
                 session.add(row)
                 session.commit()
                 session.refresh(row)
@@ -83,13 +110,14 @@ class PredictionBook:
                 select(PredictionBankroll).order_by(PredictionBankroll.id.asc())
             ).first()
             if row is None:
-                session.add(PredictionBankroll(usd_balance=target))
+                session.add(PredictionBankroll(usd_balance=target, vaulted_usd=0.0))
             else:
                 row.usd_balance = target
+                row.vaulted_usd = 0.0
                 row.updated_at = datetime.now(timezone.utc)
             session.commit()
         self._log(
-            f"Paper history reset | W/L 0-0 | bankroll ${target:,.2f}"
+            f"Paper history reset | W/L 0-0 | bankroll ${target:,.2f} | vault $0.00"
         )
 
     def _get_bankroll(self, session: Session) -> PredictionBankroll:
@@ -97,7 +125,7 @@ class PredictionBook:
             select(PredictionBankroll).order_by(PredictionBankroll.id.asc())
         ).first()
         if row is None:
-            row = PredictionBankroll(usd_balance=self.initial_balance)
+            row = PredictionBankroll(usd_balance=self.initial_balance, vaulted_usd=0.0)
             session.add(row)
             session.flush()
         return row
@@ -105,6 +133,80 @@ class PredictionBook:
     def get_balance(self) -> float:
         with self.session_factory() as session:
             return float(self._get_bankroll(session).usd_balance)
+
+    def get_vaulted(self) -> float:
+        with self.session_factory() as session:
+            return float(getattr(self._get_bankroll(session), "vaulted_usd", 0.0) or 0.0)
+
+    def maybe_vault_profits(self) -> Optional[VaultWithdrawal]:
+        """Withdraw paper profits into the vault when cash is far enough above working bank.
+
+        Rule (defaults): working bank $100, trigger +$55 → cash ≥ $155,
+        withdraw $50 (leave ~$105 so the next loss doesn't start red under $100).
+        Repeat while still above the trigger. Stop auto-vault once vaulted ≥ goal ($300).
+        """
+        if not self.vault_enabled or self.vault_withdraw_amount <= 0:
+            return None
+
+        threshold = self.vault_working_bank + self.vault_trigger_profit
+        with self.session_factory() as session:
+            bankroll = self._get_bankroll(session)
+            balance = float(bankroll.usd_balance)
+            vaulted = float(getattr(bankroll, "vaulted_usd", 0.0) or 0.0)
+            if vaulted >= self.vault_goal:
+                return None
+            if balance < threshold:
+                return None
+
+            balance_before = balance
+            withdrawn = 0.0
+            while (
+                balance >= threshold
+                and vaulted < self.vault_goal
+                and balance >= self.vault_withdraw_amount
+            ):
+                # Don't overshoot the vault goal on the last slice
+                room = self.vault_goal - vaulted
+                chunk = min(self.vault_withdraw_amount, room, balance)
+                if chunk <= 0:
+                    break
+                balance -= chunk
+                vaulted += chunk
+                withdrawn += chunk
+
+            if withdrawn <= 0:
+                return None
+
+            bankroll.usd_balance = balance
+            bankroll.vaulted_usd = vaulted
+            bankroll.updated_at = datetime.now(timezone.utc)
+            session.commit()
+
+            result = VaultWithdrawal(
+                amount=withdrawn,
+                balance_before=balance_before,
+                balance_after=balance,
+                vaulted_after=vaulted,
+                working_bank=self.vault_working_bank,
+                trigger_profit=self.vault_trigger_profit,
+                vault_goal=self.vault_goal,
+                goal_reached=vaulted >= self.vault_goal,
+            )
+            self._log_vault(result)
+            return result
+
+    def _log_vault(self, withdrawal: VaultWithdrawal) -> None:
+        goal_note = (
+            " | VAULT GOAL REACHED — auto-vault pauses"
+            if withdrawal.goal_reached
+            else ""
+        )
+        self._log(
+            f"PAPER VAULT | withdrew ${withdrawal.amount:,.2f} "
+            f"(${withdrawal.balance_before:,.2f} → ${withdrawal.balance_after:,.2f}) | "
+            f"put aside ${withdrawal.vaulted_after:,.2f} / "
+            f"${withdrawal.vault_goal:,.2f}{goal_note}"
+        )
 
     def get_open_bet(self, window_id: str) -> Optional[PredictionBet]:
         with self.session_factory() as session:
@@ -283,12 +385,18 @@ class PredictionBook:
             realized = sum(float(b.pnl or 0.0) for b in settled)
             open_bets = [b for b in bets if b.status == "OPEN"]
             balance = float(bankroll.usd_balance)
+            vaulted = float(getattr(bankroll, "vaulted_usd", 0.0) or 0.0)
             # Mark open premiums back into equity (capital at risk)
-            equity = balance + sum(float(b.contract_cost) for b in open_bets)
+            working_equity = balance + sum(float(b.contract_cost) for b in open_bets)
+            # All-in wealth includes paper withdrawals put aside
+            equity = working_equity + vaulted
             starting = float(self.initial_balance)
+            total_pnl = equity - starting
             return {
                 "starting_balance": starting,
                 "usd_balance": balance,
+                "vaulted_usd": vaulted,
+                "working_equity": working_equity,
                 "equity": equity,
                 "open_bets": len(open_bets),
                 "bet_count": len(bets),
@@ -300,10 +408,11 @@ class PredictionBook:
                 if (wins or losses)
                 else 0.0,
                 "realized_pnl": realized,
-                "total_pnl": equity - starting,
-                "total_return_pct": ((equity - starting) / starting * 100.0)
-                if starting
-                else 0.0,
+                "total_pnl": total_pnl,
+                "total_return_pct": (total_pnl / starting * 100.0) if starting else 0.0,
+                "vault_working_bank": self.vault_working_bank,
+                "vault_goal": self.vault_goal,
+                "vault_enabled": self.vault_enabled,
             }
 
     @staticmethod

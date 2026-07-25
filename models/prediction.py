@@ -21,6 +21,8 @@ class PredictionBankroll(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     usd_balance: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Simulated withdrawals ("put aside") — not available for betting
+    vaulted_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )

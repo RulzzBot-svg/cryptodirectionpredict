@@ -98,16 +98,32 @@ class TelegramNotifier:
     def window_stats(self, stats: dict[str, Any]) -> None:
         pnl = float(stats.get("total_pnl") or 0.0)
         sign = "+" if pnl >= 0 else "-"
+        vaulted = float(stats.get("vaulted_usd") or 0.0)
         msg = (
             f"WINDOW STATS\n"
             f"Bank ${float(stats.get('usd_balance') or 0):,.2f} | "
-            f"Equity ${float(stats.get('equity') or 0):,.2f}\n"
+            f"Vault ${vaulted:,.2f} | "
+            f"All-in ${float(stats.get('equity') or 0):,.2f}\n"
             f"Total P/L {sign}${abs(pnl):,.2f}\n"
             f"W/L {stats.get('win_count', 0)}W/"
             f"{stats.get('loss_count', 0)}L "
             f"({float(stats.get('win_rate_pct') or 0):.1f}%) | "
             f"Settled {stats.get('settled_count', 0)}"
         )
+        self.send(msg)
+
+    def vault_withdrawal(self, event: Any) -> None:
+        goal = float(getattr(event, "vault_goal", 0.0) or 0.0)
+        aside = float(getattr(event, "vaulted_after", 0.0) or 0.0)
+        msg = (
+            f"PAPER VAULT\n"
+            f"Withdrew ${float(event.amount):,.2f}\n"
+            f"Bank ${float(event.balance_before):,.2f} → "
+            f"${float(event.balance_after):,.2f}\n"
+            f"Put aside ${aside:,.2f} / ${goal:,.2f}"
+        )
+        if getattr(event, "goal_reached", False):
+            msg += "\nVault goal reached — auto-vault pauses."
         self.send(msg)
 
     def info(self, text: str) -> None:

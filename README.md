@@ -132,6 +132,10 @@ On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 | `MIN_EDGE` | `0.08` | Minimum edge vs ask before betting (8¢) |
 | `MARKET_PROB_ABOVE` | `0.50` | Fallback YES ask if Kalshi quotes missing |
 | `STAKE_NOTIONAL` | `5` | Face value per bet (5 contracts ⇒ pay `5 × share_price`) |
+| `VAULT_ENABLED` | `true` | Auto paper-withdraw profits above working bank |
+| `VAULT_TRIGGER_PROFIT` | `55` | Vault when cash ≥ working bank + this |
+| `VAULT_WITHDRAW_AMOUNT` | `50` | Dollars moved to “put aside” each trigger |
+| `VAULT_GOAL` | `300` | Stop auto-vault once put aside reaches this |
 | `CONTRACT_COST` | `0.50` | Legacy; ignored when using notional stake sizing |
 | `AUTO_BET` | `true` | Place paper bets automatically |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
@@ -169,6 +173,18 @@ Example: YES **34¢** / NO **66¢**, face **$20** (20 contracts):
 | NO/BELOW | `$13.20` | receive `$20` total (= `$13.20` stake back + `$6.80` profit) | lose `$13.20` stake |
 
 Default sizing is `STAKE_NOTIONAL=5` (same math at $5 face).
+
+### Paper profit vault
+
+Same working bank forever while profits get “put aside”:
+
+- Working bank **$100**, face **$5**
+- When cash reaches **+$55** over the bank (≥ **$155**), withdraw **$50**
+- Leaves ~**$105** so the next loss doesn’t start red under $100
+- Repeats until **$300** is put aside, then auto-vault pauses
+
+Telegram gets a `PAPER VAULT` ping on each withdraw. All-in P/L still counts
+vaulted cash. Live Kalshi later: same habit, real ACH withdraw.
 
 Reset paper W/L anytime:
 

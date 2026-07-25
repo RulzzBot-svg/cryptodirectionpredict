@@ -22,6 +22,14 @@ services:
         value: "100"
       - key: STAKE_NOTIONAL
         value: "5"
+      - key: VAULT_ENABLED
+        value: "true"
+      - key: VAULT_TRIGGER_PROFIT
+        value: "55"
+      - key: VAULT_WITHDRAW_AMOUNT
+        value: "50"
+      - key: VAULT_GOAL
+        value: "300"
       - key: AUTO_BET
         value: "true"
       - key: MIN_EDGE

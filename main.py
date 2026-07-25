@@ -66,6 +66,17 @@ HEARTBEAT_EVERY_SECONDS = float(os.getenv("HEARTBEAT_EVERY_SECONDS", "900"))
 STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
 
+# Paper profit vault: when cash ≥ working + trigger, withdraw amount into "put aside"
+VAULT_ENABLED = os.getenv("VAULT_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VAULT_TRIGGER_PROFIT = float(os.getenv("VAULT_TRIGGER_PROFIT", "55"))
+VAULT_WITHDRAW_AMOUNT = float(os.getenv("VAULT_WITHDRAW_AMOUNT", "50"))
+VAULT_GOAL = float(os.getenv("VAULT_GOAL", "300"))
+
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
 
@@ -141,7 +152,8 @@ def _print_performance(stats: dict[str, Any], *, kalshi_event: str = "") -> None
         print(f"  Last Kalshi mkt : {kalshi_event}")
     print(f"  Starting bank   : ${stats['starting_balance']:,.2f}")
     print(f"  Cash bankroll   : ${stats['usd_balance']:,.2f}")
-    print(f"  Equity          : ${stats['equity']:,.2f}")
+    print(f"  Vault (aside)   : ${float(stats.get('vaulted_usd') or 0):,.2f}")
+    print(f"  Equity (all-in) : ${stats['equity']:,.2f}")
     total_pnl = stats["total_pnl"]
     pnl_label = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
     print(f"  Total P/L       : {pnl_label} ({stats['total_return_pct']:+.2f}%)")
@@ -173,10 +185,16 @@ def _print_window_performance(stats: dict[str, Any]) -> None:
         )
     else:
         wr = "n/a (no settled bets yet)"
+    vaulted = float(stats.get("vaulted_usd") or 0.0)
     print("-" * 60)
     print(
         f"  WINDOW STATS | Total P/L {total_txt} | "
         f"Realized P/L {realized_txt} | Win rate {wr}"
+    )
+    print(
+        f"  Bank ${float(stats['usd_balance']):,.2f} | "
+        f"Vault ${vaulted:,.2f} | "
+        f"All-in ${float(stats['equity']):,.2f}"
     )
     print("-" * 60)
 
@@ -273,6 +291,14 @@ async def run_bot(
         f"(pay share_price × {STAKE_NOTIONAL:g} contracts)"
     )
     print(f"  Starting bank   : ${settings.paper_initial_balance:,.2f}")
+    if VAULT_ENABLED:
+        print(
+            f"  Paper vault     : ON — at +${VAULT_TRIGGER_PROFIT:g} over bank "
+            f"withdraw ${VAULT_WITHDRAW_AMOUNT:g} "
+            f"(goal ${VAULT_GOAL:g} put aside)"
+        )
+    else:
+        print("  Paper vault     : OFF")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     print(f"  Telegram alerts : {'ON' if notifier.active else 'OFF (set token/chat id)'}")
     if initial_strike:
@@ -302,6 +328,11 @@ async def run_bot(
         initial_balance=settings.paper_initial_balance,
         symbol=symbol,
         stake_notional=STAKE_NOTIONAL,
+        vault_enabled=VAULT_ENABLED,
+        vault_working_bank=settings.paper_initial_balance,
+        vault_trigger_profit=VAULT_TRIGGER_PROFIT,
+        vault_withdraw_amount=VAULT_WITHDRAW_AMOUNT,
+        vault_goal=VAULT_GOAL,
         engine=engine,
     )
     if reset_paper or RESET_PAPER_HISTORY:
@@ -317,10 +348,17 @@ async def run_bot(
         # Always lead with the wiped-run recap so Telegram has the history
         notifier.previous_run_recap()
         stats0 = book.get_performance_stats()
+        vault_txt = (
+            f"vault +${VAULT_TRIGGER_PROFIT:g}→${VAULT_WITHDRAW_AMOUNT:g} "
+            f"(goal ${VAULT_GOAL:g})"
+            if VAULT_ENABLED
+            else "vault OFF"
+        )
         notifier.info(
             f"NEW RUN STARTED | bank ${stats0['usd_balance']:,.2f} | "
+            f"aside ${float(stats0.get('vaulted_usd') or 0):,.2f} | "
             f"{stats0['win_count']}W/{stats0['loss_count']}L | "
-            f"face ${STAKE_NOTIONAL:g} | series {KALSHI_SERIES}"
+            f"face ${STAKE_NOTIONAL:g} | {vault_txt} | series {KALSHI_SERIES}"
         )
 
     exchange: Any = None
@@ -457,6 +495,9 @@ async def run_bot(
                 )
                 if settled_bet is not None:
                     notifier.bet_settled(settled_bet)
+                vault_event = book.maybe_vault_profits()
+                if vault_event is not None:
+                    notifier.vault_withdrawal(vault_event)
                 stats = book.get_performance_stats()
                 _print_window_performance(stats)
                 notifier.window_stats(stats)
@@ -582,6 +623,7 @@ async def run_bot(
                     f"HEARTBEAT alive | BTC ${price:,.2f} | "
                     f"{advice.action} edge {advice.edge*100:+.1f}¢ | "
                     f"Bank ${stats_hb['usd_balance']:,.2f} | "
+                    f"Vault ${float(stats_hb.get('vaulted_usd') or 0):,.2f} | "
                     f"{stats_hb['win_count']}W/{stats_hb['loss_count']}L | "
                     f"T-{_fmt_mmss(window.seconds_remaining())}"
                 )
