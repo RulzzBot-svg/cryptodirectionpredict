@@ -112,3 +112,20 @@ class TelegramNotifier:
 
     def info(self, text: str) -> None:
         self.send(text)
+
+    def previous_run_recap(self) -> None:
+        """Send a fixed recap of the pre-restart paper run (cloud wipe)."""
+        self.send(
+            "PREVIOUS RUN RECAP (before cloud wipe / restart)\n"
+            "----------------------------------------------\n"
+            "Days active : ~Thu Jul 24 → Sat Jul 25 (paper)\n"
+            "Started     : $100.00\n"
+            "Peak        : ~$172.35\n"
+            "Near crash  : ~$153–155\n"
+            "Total P/L   : ~+$55\n"
+            "Record      : ~67W / 82L (~45% WR)\n"
+            "Notes       : Mostly BELOW-heavy soft tape; phone Kalshi\n"
+            "              outcomes matched bot settles.\n"
+            "----------------------------------------------\n"
+            "New run starting fresh at $100 / $5 face."
+        )

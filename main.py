@@ -308,9 +308,11 @@ async def run_bot(
     )
     backup_now(database_url=settings.database_url)
     if notifier.active:
+        # Always lead with the wiped-run recap so Telegram has the history
+        notifier.previous_run_recap()
         stats0 = book.get_performance_stats()
         notifier.info(
-            f"Bot started | bank ${stats0['usd_balance']:,.2f} | "
+            f"NEW RUN STARTED | bank ${stats0['usd_balance']:,.2f} | "
             f"{stats0['win_count']}W/{stats0['loss_count']}L | "
             f"face ${STAKE_NOTIONAL:g} | series {KALSHI_SERIES}"
         )
