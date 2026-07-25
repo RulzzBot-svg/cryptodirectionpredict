@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Start the paper bot on Render (or any host) with disk-backed paths.
-set -euo pipefail
+# Start the paper bot on Render with disk-backed paths + auto-restart.
+set -uo pipefail
 
 DATA_DIR="${DATA_DIR:-/var/data}"
 mkdir -p "${DATA_DIR}/logs" "${DATA_DIR}/backups"
@@ -13,8 +13,30 @@ export CALIBRATION_LOG="${CALIBRATION_LOG:-${DATA_DIR}/logs/calibration.csv}"
 
 cd "$(dirname "$0")/.."
 
-# Optional one-shot reset: set RESET_PAPER_HISTORY=true in Render env, then remove it.
+RESET_FLAG="${DATA_DIR}/.paper_reset_done"
+want_reset=false
 if [[ "${RESET_PAPER_HISTORY:-false}" =~ ^(1|true|yes|on)$ ]]; then
-  exec python main.py --reset-paper
+  want_reset=true
 fi
-exec python main.py
+
+# Keep the worker alive across crashes / brief Render blips.
+while true; do
+  if [[ "${want_reset}" == "true" && ! -f "${RESET_FLAG}" ]]; then
+    echo "[start_render] first boot reset → $100 bank"
+    python main.py --reset-paper
+    exit_code=$?
+    # Only mark reset done if the process ran long enough to init DB,
+    # or if it exited cleanly after a short intentional stop.
+    if [[ -f "${DATA_DIR}/paper_trading.db" ]]; then
+      touch "${RESET_FLAG}"
+      echo "[start_render] reset complete; future restarts will NOT wipe bank"
+    fi
+  else
+    echo "[start_render] starting bot (no reset)"
+    python main.py
+    exit_code=$?
+  fi
+
+  echo "[start_render] bot exited code=${exit_code:-?} — restarting in 5s"
+  sleep 5
+done

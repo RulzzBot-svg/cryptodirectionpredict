@@ -573,7 +573,10 @@ async def run_bot(
         _print_performance(final_stats, kalshi_event=kalshi_event)
         if notifier.active:
             notifier.window_stats(final_stats)
-            notifier.info("Bot stopped")
+            notifier.info(
+                "Bot process stopped (Render redeploy/restart/crash). "
+                "If hosted with auto-restart it should come back in a few seconds."
+            )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
