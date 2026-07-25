@@ -60,6 +60,8 @@ RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() 
 }
 BACKUP_EVERY_SECONDS = float(os.getenv("BACKUP_EVERY_SECONDS", "300"))
 CALIBRATION_EVERY_SECONDS = float(os.getenv("CALIBRATION_EVERY_SECONDS", "60"))
+# Telegram "still alive" ping (0 disables)
+HEARTBEAT_EVERY_SECONDS = float(os.getenv("HEARTBEAT_EVERY_SECONDS", "900"))
 # kalshi (default) | manual | auto
 STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -122,7 +124,11 @@ def _print_status(
         f"{action:<5} | "
         f"Bank ${bankroll:,.2f}"
     )
-    print(f"\r{line:<150}", end="", flush=True)
+    # Render/log hosts aren't TTYs — \r status lines never appear. Use newlines there.
+    if sys.stdout.isatty():
+        print(f"\r{line:<150}", end="", flush=True)
+    else:
+        print(line, flush=True)
 
 
 def _print_performance(stats: dict[str, Any], *, kalshi_event: str = "") -> None:
@@ -327,6 +333,7 @@ async def run_bot(
     warned_stale_file = False
     last_backup_at = datetime.now(timezone.utc).timestamp()
     last_calibration_at = 0.0
+    last_heartbeat_at = 0.0
     last_cal_window = ""
 
     try:
@@ -564,6 +571,21 @@ async def run_bot(
             if (now_ts - last_backup_at) >= BACKUP_EVERY_SECONDS:
                 backup_now(database_url=settings.database_url)
                 last_backup_at = now_ts
+
+            if (
+                notifier.active
+                and HEARTBEAT_EVERY_SECONDS > 0
+                and (now_ts - last_heartbeat_at) >= HEARTBEAT_EVERY_SECONDS
+            ):
+                stats_hb = book.get_performance_stats()
+                notifier.info(
+                    f"HEARTBEAT alive | BTC ${price:,.2f} | "
+                    f"{advice.action} edge {advice.edge*100:+.1f}¢ | "
+                    f"Bank ${stats_hb['usd_balance']:,.2f} | "
+                    f"{stats_hb['win_count']}W/{stats_hb['loss_count']}L | "
+                    f"T-{_fmt_mmss(window.seconds_remaining())}"
+                )
+                last_heartbeat_at = now_ts
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
