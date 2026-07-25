@@ -94,6 +94,34 @@ Terminal output (status ticks, bets, settlements) is also appended to
 Settlement prefers the **official Kalshi YES/NO result** when available,
 falling back to Coinbase spot otherwise.
 
+### Kalshi cash-out + API prep (before live)
+
+**Saving profits early is the right move.** On real Kalshi money: leave a fixed
+working bank on the platform (e.g. ~$100 at $5 face) and withdraw settled cash
+above that to your linked US bank (ACH, usually a few business days). Paper
+mode does not move bank money — that habit is for live.
+
+**Get API credentials this weekend** so launch next week is just wiring secrets,
+not hunting for keys:
+
+1. Log in at [kalshi.com](https://kalshi.com) (or [demo.kalshi.co](https://demo.kalshi.co) to practice)
+2. **Account & security → API Keys → Create Key**
+3. Save the downloaded **`.key` private key** somewhere safe (not in git — shown once)
+4. Copy the **API Key ID** shown on screen
+5. Put both in `.env` (see `.env.example`), then smoke-test:
+
+```bash
+pip install -r requirements.txt
+python scripts/check_kalshi_auth.py
+```
+
+That call only reads `/portfolio/balance`. It does **not** place orders.
+Paper trading keeps using the public Kalshi feed; authenticated keys are for
+live later. Keep `LIVE_TRADING=false` until after the paper week review.
+
+On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
+`.key` file on the disk) as secrets — never commit them.
+
 ### Useful env vars
 
 | Variable | Default | Meaning |
@@ -111,6 +139,10 @@ falling back to Coinbase spot otherwise.
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Enable Telegram trade alerts |
 | `KALSHI_SERIES` | `KXBTC15M` | Contract series (ETH/SOL later if desired) |
+| `KALSHI_API_KEY_ID` | — | Auth Key ID (live prep; not needed for paper) |
+| `KALSHI_PRIVATE_KEY_PATH` / `KALSHI_PRIVATE_KEY_PEM` | — | RSA private key for request signing |
+| `KALSHI_ENV` | `prod` | `prod` or `demo` (sets API base URL) |
+| `LIVE_TRADING` | `false` | Must stay off until paper week is done |
 
 > **Note:** Cursor Cloud / some VPS regions get HTTP 451 from Binance. Prefer Coinbase (`BTC/USD`) or Kraken there.
 
