@@ -31,10 +31,13 @@ from dotenv import load_dotenv
 
 from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.settings import load_settings
+from data.backup import backup_now, restore_latest_backup
+from data.calibration import CalibrationLog
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
-from data.kalshi import fetch_current_btc_15m
+from data.kalshi import fetch_current_btc_15m, fetch_window_settlement
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
+from notifications import TelegramNotifier
 from prediction.advisor import PredictionAdvisor
 from prediction.window import WindowManager
 
@@ -55,6 +58,8 @@ RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() 
     "yes",
     "on",
 }
+BACKUP_EVERY_SECONDS = float(os.getenv("BACKUP_EVERY_SECONDS", "300"))
+CALIBRATION_EVERY_SECONDS = float(os.getenv("CALIBRATION_EVERY_SECONDS", "60"))
 # kalshi (default) | manual | auto
 STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -233,6 +238,14 @@ async def run_bot(
         (1.0 - market_prob_above) if market_locked else None
     )
 
+    # Survive cloud rebuilds: restore DB from durable artifacts if local file missing
+    if not reset_paper and not RESET_PAPER_HISTORY:
+        if restore_latest_backup(database_url=settings.database_url):
+            print(f"[{_utcnow_label()}] Restored paper DB from durable backup")
+
+    notifier = TelegramNotifier()
+    calibration = CalibrationLog()
+
     print("=" * 60)
     print("  BTC 15m PREDICTION EDGE BOT")
     print("=" * 60)
@@ -255,18 +268,22 @@ async def run_bot(
     )
     print(f"  Starting bank   : ${settings.paper_initial_balance:,.2f}")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
+    print(f"  Telegram alerts : {'ON' if notifier.active else 'OFF (set token/chat id)'}")
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
     else:
         print("  Manual strike   : none (Kalshi/auto)")
     print(f"  Database        : {settings.database_url}")
     print(f"  Log file        : {os.getenv('_BOT_LOG_PATH', 'logs/bot.log')}")
+    print(f"  Calibration log : {calibration.path}")
+    print(f"  Backup dir      : {os.getenv('BACKUP_DIR', '/opt/cursor/artifacts/paper-bot-backups')}")
     print(f"  Started         : {_utcnow_label()}")
     print("=" * 60)
     print("  Kalshi auto-selects the current ET window ticker")
     print("  (e.g. KXBTC15M-26JUL231400). Manual files are ignored in this mode.")
+    print("  Settles prefer official Kalshi YES/NO result when available.")
     print("  Win: receive full face (= stake back + profit). Lose: lose stake paid.")
-    print("  All terminal output is appended to the log file.")
+    print("  DB/log backed up periodically to survive cloud rebuilds.")
     print("  Press Ctrl+C to stop and print performance stats.")
     print("=" * 60)
     print()
@@ -289,6 +306,14 @@ async def run_bot(
         market_prob_above=market_prob_above,
         min_seconds_to_bet=MIN_SECONDS_TO_BET,
     )
+    backup_now(database_url=settings.database_url)
+    if notifier.active:
+        stats0 = book.get_performance_stats()
+        notifier.info(
+            f"Bot started | bank ${stats0['usd_balance']:,.2f} | "
+            f"{stats0['win_count']}W/{stats0['loss_count']}L | "
+            f"face ${STAKE_NOTIONAL:g} | series {KALSHI_SERIES}"
+        )
 
     exchange: Any = None
     consecutive_errors = 0
@@ -296,7 +321,11 @@ async def run_bot(
     pending_manual_strike = initial_strike  # CLI / env only
     kalshi_strike: Optional[float] = None
     kalshi_event: str = ""
+    kalshi_market_ticker: str = ""
     warned_stale_file = False
+    last_backup_at = datetime.now(timezone.utc).timestamp()
+    last_calibration_at = 0.0
+    last_cal_window = ""
 
     try:
         exchange = create_rest_exchange(provider)
@@ -336,6 +365,7 @@ async def run_bot(
                     kalshi = None
                 if kalshi is not None:
                     kalshi_event = kalshi.event_ticker or kalshi.ticker
+                    kalshi_market_ticker = kalshi.ticker or kalshi_market_ticker
                     if kalshi.strike is not None:
                         kalshi_strike = float(kalshi.strike)
                     if not market_locked:
@@ -388,20 +418,56 @@ async def run_bot(
             lock_price = kalshi_strike or strike_hint
             window, expired = windows.update(price, strike_price=lock_price)
             if expired is not None:
+                settle_price = float(expired.settlement_price or price)
+                outcome_side = expired.outcome
+                settle_source = "coinbase_spot"
+                if use_kalshi:
+                    side, exp_val, src = await asyncio.to_thread(
+                        fetch_window_settlement,
+                        series_ticker=KALSHI_SERIES,
+                        window_end=expired.end,
+                        market_ticker=kalshi_market_ticker or None,
+                    )
+                    if side in ("ABOVE", "BELOW"):
+                        outcome_side = side
+                        settle_source = src
+                        if exp_val is not None and exp_val > 0:
+                            settle_price = float(exp_val)
+                        expired.outcome = side
+                        expired.settlement_price = settle_price
                 print()
                 print(
                     f"[{_utcnow_label()}] Window {expired.window_id} settled "
-                    f"{expired.outcome} @ ${float(expired.settlement_price):,.2f} "
-                    f"(strike ${float(expired.strike):,.2f})"
+                    f"{outcome_side} @ ${settle_price:,.2f} "
+                    f"(strike ${float(expired.strike):,.2f}) via {settle_source}"
                 )
-                book.settle_window(expired, float(expired.settlement_price or price))
-                _print_window_performance(book.get_performance_stats())
+                settled_bet = book.settle_window(
+                    expired,
+                    settle_price,
+                    outcome_side=outcome_side if outcome_side in ("ABOVE", "BELOW") else None,
+                )
+                if settled_bet is not None:
+                    notifier.bet_settled(settled_bet)
+                stats = book.get_performance_stats()
+                _print_window_performance(stats)
+                notifier.window_stats(stats)
+                calibration.log_settle(
+                    window_id=expired.window_id,
+                    symbol=symbol,
+                    strike=float(expired.strike) if expired.strike is not None else None,
+                    outcome=outcome_side,
+                    settlement_price=settle_price,
+                    settlement_source=settle_source,
+                )
+                backup_now(database_url=settings.database_url)
+                last_backup_at = datetime.now(timezone.utc).timestamp()
                 # CLI manual strike applies to one window unless re-passed
                 if initial_strike is None:
                     pending_manual_strike = None
                 last_announced_strike = None
                 kalshi_strike = None
                 kalshi_event = ""
+                kalshi_market_ticker = ""
                 if not market_locked:
                     yes_ask = None
                     no_ask = None
@@ -445,14 +511,39 @@ async def run_bot(
                 no_ask=no_ask,
             )
 
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if (
+                window.window_id != last_cal_window
+                or (now_ts - last_calibration_at) >= CALIBRATION_EVERY_SECONDS
+            ):
+                calibration.log_advice(
+                    window_id=window.window_id,
+                    symbol=symbol,
+                    spot=price,
+                    strike=float(window.strike),
+                    seconds_remaining=window.seconds_remaining(),
+                    prob_above=advice.prob_above,
+                    prob_below=advice.prob_below,
+                    yes_ask=yes_ask,
+                    no_ask=no_ask,
+                    action=advice.action,
+                    edge=advice.edge,
+                )
+                last_calibration_at = now_ts
+                last_cal_window = window.window_id
+
             if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
                 print()
-                book.place_bet(
+                placed = book.place_bet(
                     window,
                     advice,
                     contract_price=advice.entry_share_price,
                     stake_notional=STAKE_NOTIONAL,
                 )
+                if placed is not None:
+                    notifier.bet_placed(placed, reason=advice.reason)
+                    backup_now(database_url=settings.database_url)
+                    last_backup_at = datetime.now(timezone.utc).timestamp()
 
             status_mkt = yes_ask if yes_ask is not None else market_prob_above
             _print_status(
@@ -468,13 +559,19 @@ async def run_bot(
                 market_prob=status_mkt if status_mkt is not None else 0.0,
             )
 
+            if (now_ts - last_backup_at) >= BACKUP_EVERY_SECONDS:
+                backup_now(database_url=settings.database_url)
+                last_backup_at = now_ts
+
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
         await close_exchange(exchange)
-        _print_performance(
-            book.get_performance_stats(),
-            kalshi_event=kalshi_event,
-        )
+        backup_now(database_url=settings.database_url)
+        final_stats = book.get_performance_stats()
+        _print_performance(final_stats, kalshi_event=kalshi_event)
+        if notifier.active:
+            notifier.window_stats(final_stats)
+            notifier.info("Bot stopped")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

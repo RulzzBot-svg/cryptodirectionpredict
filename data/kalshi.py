@@ -327,3 +327,72 @@ def fetch_current_btc_15m(
 
     logger.warning("No active Kalshi BTC 15m market found for %s", event_ticker)
     return None
+
+
+def fetch_markets_for_event(
+    event_ticker: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+) -> list[KalshiBtcWindow]:
+    try:
+        markets = fetch_markets(
+            event_ticker=event_ticker,
+            status=None,
+            limit=10,
+            base_url=base_url,
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Kalshi settle fetch failed (%s): %s", event_ticker, exc)
+        return []
+    return [_from_market(m) for m in markets]
+
+
+def kalshi_result_side(market: KalshiBtcWindow) -> Optional[str]:
+    """
+    Map Kalshi market ``result`` to ABOVE/BELOW when determined/finalized.
+
+    YES → ABOVE, NO → BELOW for BTC 15m up/down contracts.
+    """
+    raw = market.raw or {}
+    result = str(raw.get("result") or "").strip().lower()
+    if result in {"yes", "y"}:
+        return "ABOVE"
+    if result in {"no", "n"}:
+        return "BELOW"
+    # settlement_value_dollars: 1.0 ⇒ YES won, 0.0 ⇒ NO won
+    settle = _quote_dollars(raw, "settlement_value_dollars", "settlement_value")
+    if settle is None:
+        return None
+    if settle >= 0.99:
+        return "ABOVE"
+    if settle <= 0.01:
+        return "BELOW"
+    return None
+
+
+def fetch_window_settlement(
+    *,
+    series_ticker: str = DEFAULT_SERIES,
+    window_end: datetime,
+    base_url: str = DEFAULT_BASE_URL,
+    market_ticker: Optional[str] = None,
+) -> tuple[Optional[str], Optional[float], str]:
+    """
+    Resolve official Kalshi outcome for a just-ended 15m window.
+
+    Returns (side, expiration_value_or_None, source_label).
+    """
+    # Event ticker is keyed by window END time in ET
+    probe = window_end - timedelta(seconds=1)
+    event_ticker = expected_event_ticker(series_ticker=series_ticker, now=probe)
+    markets = fetch_markets_for_event(event_ticker, base_url=base_url)
+    if market_ticker:
+        markets = [m for m in markets if m.ticker == market_ticker] or markets
+    for market in markets:
+        side = kalshi_result_side(market)
+        if side is None:
+            continue
+        exp_raw = (market.raw or {}).get("expiration_value")
+        exp_val = _parse_float(exp_raw)
+        return side, exp_val, f"kalshi:{market.ticker}:{market.status}"
+    return None, None, f"kalshi_pending:{event_ticker}"

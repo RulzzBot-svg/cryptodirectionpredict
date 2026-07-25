@@ -76,6 +76,24 @@ Terminal output (status ticks, bets, settlements) is also appended to
 `logs/bot.log` (rotates when large). Bets themselves still live in
 `paper_trading.db`.
 
+### Durability + alerts
+
+- **Backups:** every few minutes the bot copies `paper_trading.db`,
+  `logs/bot.log`, `logs/calibration.csv`, and a bets CSV into
+  `BACKUP_DIR` (default `/opt/cursor/artifacts/paper-bot-backups`).
+  On startup, if the local DB is missing, it restores the latest backup.
+- **Calibration log:** `logs/calibration.csv` records model % vs market
+  asks over time (and window outcomes) for later review.
+- **Telegram:** set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` to get pings
+  on bet placed, settlement, and window stats.
+  1. Message `@BotFather` → `/newbot` → copy token
+  2. Message your bot once, then get chat id via
+     `https://api.telegram.org/bot<TOKEN>/getUpdates`
+  3. Put both values in `.env` and restart
+
+Settlement prefers the **official Kalshi YES/NO result** when available,
+falling back to Coinbase spot otherwise.
+
 ### Useful env vars
 
 | Variable | Default | Meaning |
@@ -90,6 +108,9 @@ Terminal output (status ticks, bets, settlements) is also appended to
 | `AUTO_BET` | `true` | Place paper bets automatically |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
+| `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Enable Telegram trade alerts |
+| `KALSHI_SERIES` | `KXBTC15M` | Contract series (ETH/SOL later if desired) |
 
 > **Note:** Cursor Cloud / some VPS regions get HTTP 451 from Binance. Prefer Coinbase (`BTC/USD`) or Kraken there.
 

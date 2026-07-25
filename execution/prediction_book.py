@@ -225,6 +225,8 @@ class PredictionBook:
         self,
         window: PredictionWindow,
         final_price: float,
+        *,
+        outcome_side: Optional[str] = None,
     ) -> Optional[PredictionBet]:
         if window.strike is None:
             return None
@@ -239,8 +241,11 @@ class PredictionBook:
             if bet is None:
                 return None
 
-            # Robinhood/Kalshi: YES if settlement >= strike (at or above)
-            if final_price >= float(bet.strike):
+            # Prefer official Kalshi/RH result when provided; else price vs strike
+            if outcome_side in ("ABOVE", "BELOW"):
+                outcome = outcome_side
+            elif final_price >= float(bet.strike):
+                # Robinhood/Kalshi: YES if settlement >= strike (at or above)
                 outcome = "ABOVE"
             else:
                 outcome = "BELOW"
