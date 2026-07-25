@@ -131,12 +131,21 @@ def _export_bets_csv(db_path: Path, dest: Path) -> None:
     try:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT id, placed_at, window_id, side, strike, entry_price, "
-            "quantity, contract_price, contract_cost, payout, model_prob, "
-            "market_prob, edge, status, settlement_price, outcome, pnl, "
-            "settled_at, usd_balance_after FROM prediction_bets ORDER BY id"
-        ).fetchall()
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "prediction_bets" not in tables:
+            conn.close()
+            return
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(prediction_bets)").fetchall()]
+        if not cols:
+            conn.close()
+            return
+        sql = f"SELECT {', '.join(cols)} FROM prediction_bets ORDER BY id"
+        rows = conn.execute(sql).fetchall()
         conn.close()
     except sqlite3.Error as exc:
         logger.warning("Bet CSV export failed: %s", exc)
@@ -144,7 +153,8 @@ def _export_bets_csv(db_path: Path, dest: Path) -> None:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        dest.write_text("", encoding="utf-8")
+        with dest.open("w", encoding="utf-8", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=cols).writeheader()
         return
     with dest.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
