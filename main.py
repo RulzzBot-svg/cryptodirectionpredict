@@ -30,11 +30,19 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from config.bot_logging import setup_bot_logging, shutdown_bot_logging
+from config.live_gate import (
+    EARLIEST_LIVE_DATE,
+    enforce_live_gate,
+    live_dry_run_requested,
+    live_trading_requested,
+)
 from config.settings import load_settings
 from data.backup import backup_now, restore_latest_backup
 from data.calibration import CalibrationLog
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
 from data.kalshi import fetch_current_btc_15m, fetch_window_settlement
+from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
+from execution.live_kalshi import LiveKalshiExecutor
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
 from notifications import TelegramNotifier
@@ -76,6 +84,10 @@ VAULT_ENABLED = os.getenv("VAULT_ENABLED", "true").strip().lower() in {
 VAULT_TRIGGER_PROFIT = float(os.getenv("VAULT_TRIGGER_PROFIT", "55"))
 VAULT_WITHDRAW_AMOUNT = float(os.getenv("VAULT_WITHDRAW_AMOUNT", "50"))
 VAULT_GOAL = float(os.getenv("VAULT_GOAL", "300"))
+
+# Live scaffold (orders OFF by default; hard-gated until paper week ends)
+LIVE_TRADING = live_trading_requested()
+LIVE_DRY_RUN = live_dry_run_requested()
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -300,6 +312,17 @@ async def run_bot(
     else:
         print("  Paper vault     : OFF")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
+    if LIVE_TRADING:
+        print("  Live trading    : ARMED (real Kalshi orders)")
+    elif LIVE_DRY_RUN:
+        print(
+            "  Live trading    : DRY-RUN (log/Telegram payloads only; "
+            "paper bets still run)"
+        )
+    else:
+        print(
+            f"  Live trading    : OFF (earliest unlock {EARLIEST_LIVE_DATE.isoformat()})"
+        )
     print(f"  Telegram alerts : {'ON' if notifier.active else 'OFF (set token/chat id)'}")
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
@@ -335,6 +358,34 @@ async def run_bot(
         vault_goal=VAULT_GOAL,
         engine=engine,
     )
+
+    live_exec: Optional[LiveKalshiExecutor] = None
+    if LIVE_TRADING or LIVE_DRY_RUN:
+        auth_client = None
+        if credentials_configured():
+            try:
+                auth_client = KalshiAuthClient.from_env()
+                bal = auth_client.get_balance()
+                print(
+                    f"[{_utcnow_label()}] Kalshi auth OK | "
+                    f"cash ${bal.balance_usd:,.2f} | base {auth_client.base_url}"
+                )
+            except KalshiAuthError as exc:
+                print(f"[{_utcnow_label()}] Kalshi auth FAILED: {exc}")
+                if LIVE_TRADING:
+                    raise SystemExit("LIVE_TRADING requires working Kalshi credentials") from exc
+        elif LIVE_TRADING:
+            raise SystemExit("LIVE_TRADING requires KALSHI_API_KEY_ID + private key")
+        else:
+            print(
+                f"[{_utcnow_label()}] LIVE_DRY_RUN on without creds — "
+                "will only log local payloads"
+            )
+        live_exec = LiveKalshiExecutor(
+            auth_client,
+            dry_run=not LIVE_TRADING,
+            stake_notional=STAKE_NOTIONAL,
+        )
     if reset_paper or RESET_PAPER_HISTORY:
         book.reset_paper_history(balance=settings.paper_initial_balance)
     windows = WindowManager(window_minutes=15)
@@ -584,16 +635,48 @@ async def run_bot(
 
             if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
                 print()
-                placed = book.place_bet(
-                    window,
-                    advice,
-                    contract_price=advice.entry_share_price,
-                    stake_notional=STAKE_NOTIONAL,
-                )
-                if placed is not None:
-                    notifier.bet_placed(placed, reason=advice.reason)
-                    backup_now(database_url=settings.database_url)
-                    last_backup_at = datetime.now(timezone.utc).timestamp()
+                # Optional live rehearsal / (gated) live submit
+                live_filled = False
+                if live_exec is not None and advice.entry_share_price is not None:
+                    ticker = kalshi_market_ticker.strip()
+                    if ticker:
+                        plan = live_exec.plan_order(
+                            market_ticker=ticker,
+                            advice_side=advice.action,  # type: ignore[arg-type]
+                            share_price=float(advice.entry_share_price),
+                        )
+                        plan = live_exec.execute(plan)
+                        note = "ORDER" if plan.submitted else "DRY-RUN"
+                        print(
+                            f"[{_utcnow_label()}] LIVE {note} {plan.advice_side} "
+                            f"{plan.book_side} @{plan.yes_book_price*100:.1f}¢ "
+                            f"x{plan.contracts:.2f} {plan.market_ticker}"
+                            + (f" err={plan.error}" if plan.error else "")
+                        )
+                        notifier.live_order_plan(plan, note=note)
+                        live_filled = bool(plan.submitted and plan.filled)
+                    else:
+                        print(
+                            f"[{_utcnow_label()}] LIVE skip — no market ticker yet"
+                        )
+                # Paper stays the source of truth until real live is unlocked.
+                # When LIVE_TRADING is armed, skip paper to avoid double-counting.
+                if not LIVE_TRADING:
+                    placed = book.place_bet(
+                        window,
+                        advice,
+                        contract_price=advice.entry_share_price,
+                        stake_notional=STAKE_NOTIONAL,
+                    )
+                    if placed is not None:
+                        notifier.bet_placed(placed, reason=advice.reason)
+                        backup_now(database_url=settings.database_url)
+                        last_backup_at = datetime.now(timezone.utc).timestamp()
+                elif live_filled:
+                    print(
+                        f"[{_utcnow_label()}] LIVE fill recorded "
+                        "(paper mirror not written in this scaffold)"
+                    )
 
             status_mkt = yes_ask if yes_ask is not None else market_prob_above
             _print_status(
@@ -648,6 +731,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ["_BOT_LOG_PATH"] = str(log_path.resolve())
     logging.getLogger("data.feed").setLevel(logging.WARNING)
     logging.getLogger("data.kalshi").setLevel(logging.WARNING)
+
+    # Hard refuse real live orders before paper week ends (and without confirm phrase)
+    enforce_live_gate()
 
     args = _parse_args(argv)
     strike = _parse_number(args.strike) if args.strike else None

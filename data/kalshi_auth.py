@@ -181,6 +181,57 @@ class KalshiAuthClient:
             raw=payload,
         )
 
+    def create_order_v2(self, order: dict[str, Any]) -> dict[str, Any]:
+        """POST /portfolio/events/orders — places a real order when called."""
+        response = self.request("POST", "/portfolio/events/orders", json_body=order)
+        if response.status_code == 401:
+            raise KalshiAuthError("401 Unauthorized creating order")
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Create order failed ({response.status_code}): {response.text[:400]}"
+            )
+        return response.json()
+
+    def cancel_order_v2(self, order_id: str) -> dict[str, Any]:
+        """DELETE /portfolio/events/orders/{order_id}."""
+        response = self.request("DELETE", f"/portfolio/events/orders/{order_id}")
+        if response.status_code == 401:
+            raise KalshiAuthError("401 Unauthorized canceling order")
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Cancel order failed ({response.status_code}): {response.text[:400]}"
+            )
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    def get_positions(self, *, ticker: Optional[str] = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
+        response = self.request("GET", "/portfolio/positions", params=params or None)
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Positions failed ({response.status_code}): {response.text[:300]}"
+            )
+        return response.json()
+
+    def get_orders(self, *, ticker: Optional[str] = None, status: Optional[str] = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        response = self.request("GET", "/portfolio/orders", params=params or None)
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Orders failed ({response.status_code}): {response.text[:300]}"
+            )
+        return response.json()
+
 
 def credentials_configured(env: Optional[dict[str, str]] = None) -> bool:
     """True if enough env is set to attempt an authenticated call."""

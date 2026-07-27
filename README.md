@@ -119,8 +119,18 @@ That call only reads `/portfolio/balance`. It does **not** place orders.
 Paper trading keeps using the public Kalshi feed; authenticated keys are for
 live later. Keep `LIVE_TRADING=false` until after the paper week review.
 
+**Live scaffold (orders still off):** Kalshi V2 order payloads are built in
+`execution/live_kalshi.py`. Real submits are hard-blocked until
+**2026-07-30** and require `LIVE_CONFIRM=YES_I_FINISHED_PAPER_WEEK`.
+
+```bash
+python scripts/check_live_ready.py   # auth + sample payloads, no orders
+# Optional on a non-Render copy: LIVE_DRY_RUN=true  (Telegram LIVE DRY-RUN pings)
+```
+
 On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
-`.key` file on the disk) as secrets — never commit them.
+`.key` file on the disk) as secrets — never commit them. Do **not** flip
+`LIVE_TRADING` on the paper worker yet.
 
 ### Useful env vars
 

@@ -126,6 +126,22 @@ class TelegramNotifier:
             msg += "\nVault goal reached — auto-vault pauses."
         self.send(msg)
 
+    def live_order_plan(self, plan: Any, *, note: str = "DRY-RUN") -> None:
+        msg = (
+            f"LIVE {note}\n"
+            f"{plan.advice_side} via YES-{plan.book_side} @ "
+            f"{float(plan.yes_book_price)*100:.1f}¢\n"
+            f"Pay side ~{float(plan.share_price)*100:.1f}¢ × "
+            f"{float(plan.contracts):.2f} contracts\n"
+            f"Ticker {plan.market_ticker}\n"
+            f"client_order_id {plan.client_order_id}"
+        )
+        if getattr(plan, "order_id", None):
+            msg += f"\norder_id {plan.order_id} fill={float(plan.fill_count):.2f}"
+        if getattr(plan, "error", None):
+            msg += f"\nERROR: {plan.error}"
+        self.send(msg)
+
     def info(self, text: str) -> None:
         self.send(text)
 
