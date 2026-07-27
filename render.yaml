@@ -5,7 +5,7 @@ services:
     runtime: python
     plan: starter
     region: oregon
-    branch: cursor/alerts-backup-calibration-1b7a
+    branch: cursor/fix-disk-full-1b7a
     buildCommand: pip install -r requirements.txt
     startCommand: bash scripts/start_render.sh
     autoDeploy: true
@@ -18,6 +18,12 @@ services:
         value: "3.12.8"
       - key: DATA_DIR
         value: /var/data
+      - key: BACKUP_KEEP
+        value: "6"
+      - key: LOG_MAX_BYTES
+        value: "2097152"
+      - key: LOG_BACKUP_COUNT
+        value: "2"
       - key: PAPER_INITIAL_BALANCE
         value: "100"
       - key: STAKE_NOTIONAL
