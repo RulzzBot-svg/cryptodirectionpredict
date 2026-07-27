@@ -39,11 +39,19 @@ def main() -> int:
     print(f"  paper week unlock date : {EARLIEST_LIVE_DATE.isoformat()}")
     print(f"  paper week complete    : {paper_week_complete()}")
     print(f"  LIVE_TRADING requested : {live_trading_requested()}")
-    block = describe_live_block_reason()
-    if block:
-        print(f"  live arm status        : BLOCKED — {block}")
+    if live_trading_requested():
+        block = describe_live_block_reason()
+        if block:
+            print(f"  live arm status        : BLOCKED — {block}")
+        else:
+            print("  live arm status        : ALLOWED (still confirm carefully)")
     else:
-        print("  live arm status        : would be allowed (still confirm carefully)")
+        print("  live arm status        : OFF (LIVE_TRADING not set)")
+        if not paper_week_complete():
+            print(
+                f"  note                   : real live stays locked until "
+                f"{EARLIEST_LIVE_DATE.isoformat()}"
+            )
 
     if not credentials_configured():
         print("\nCredentials missing. Set KALSHI_API_KEY_ID + private key first.")
