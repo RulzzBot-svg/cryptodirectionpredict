@@ -138,6 +138,21 @@ Example: YES **34¢** / NO **66¢**, face **$20** (20 contracts):
 
 Default sizing is `STAKE_NOTIONAL=5` (same math at $5 face).
 
+### Results breakdown (hour / side / price)
+
+Read-only report — safe to run while the bot is live:
+
+```bash
+python scripts/hourly_pnl.py --block 6                      # 6-hour blocks, UTC
+python scripts/hourly_pnl.py --tz America/Los_Angeles --block 3
+python scripts/hourly_pnl.py --db /var/data/paper_trading.db
+python scripts/hourly_pnl.py --csv /var/data/backups/bets.latest.csv
+```
+
+Shows settled count, W/L, win rate, average price paid, P/L, and ROI on money
+risked — grouped by hour placed, by ABOVE/BELOW, and by entry-price bucket.
+Useful for checking whether a time-of-day effect is real before acting on it.
+
 Reset paper W/L anytime:
 
 ```bash
