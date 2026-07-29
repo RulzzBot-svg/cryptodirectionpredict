@@ -55,9 +55,12 @@ def restore_latest_backup(*, database_url: Optional[str] = None) -> bool:
     if not root.exists():
         return False
 
-    candidates = sorted(root.glob("paper_trading_*.db"), reverse=True)
-    # Also accept a stable latest symlink/copy
-    latest = root / "paper_trading.latest.db"
+    # Only restore backups taken from a DB of the same name. Live and paper
+    # use different files, and seeding live with paper history is worse than
+    # starting empty.
+    stem = db_path.stem
+    candidates = sorted(root.glob(f"{stem}_*.db"), reverse=True)
+    latest = root / f"{stem}.latest.db"
     if latest.exists():
         candidates = [latest] + candidates
 
@@ -94,15 +97,16 @@ def backup_now(
         return None
 
     stamp = _stamp()
-    dest = root / f"paper_trading_{stamp}.db"
+    stem = db_path.stem
+    dest = root / f"{stem}_{stamp}.db"
     try:
         shutil.copy2(db_path, dest)
-        shutil.copy2(db_path, root / "paper_trading.latest.db")
+        shutil.copy2(db_path, root / f"{stem}.latest.db")
     except OSError as exc:
         logger.error("Backup DB copy failed (disk full?): %s", exc)
         _prune_backup_artifacts(root, keep=1)
         try:
-            shutil.copy2(db_path, root / "paper_trading.latest.db")
+            shutil.copy2(db_path, root / f"{stem}.latest.db")
         except OSError:
             return None
         return None
@@ -155,7 +159,7 @@ def _copy_truncated(src: Path, dest: Path, max_bytes: int) -> None:
 def _prune_backup_artifacts(root: Path, *, keep: int) -> None:
     keep = max(1, int(keep))
     for pattern in (
-        "paper_trading_*.db",
+        "*_????????T??????Z.db",
         "bot_*.log",
         "calibration_*.csv",
         "bets_*.csv",

@@ -49,6 +49,31 @@ class KalshiAuthError(RuntimeError):
     """Raised when Kalshi credentials are missing or invalid."""
 
 
+def _normalize_pem(raw: bytes) -> bytes:
+    """Repair the common ways a pasted PEM arrives broken.
+
+    Handles literal ``\\n`` escapes (env vars), CRLF line endings (Windows),
+    indentation, blank lines, and a missing trailing newline. The base64 body
+    itself is never altered.
+    """
+    text = raw.decode("utf-8", errors="replace").strip()
+    # Env-var style: whole key on one line with escaped newlines
+    if "\\n" in text:
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        raise KalshiAuthError("Private key is empty")
+    if not lines[0].startswith("-----BEGIN") or not lines[-1].startswith("-----END"):
+        raise KalshiAuthError(
+            "Private key is not a PEM block. It must start with a "
+            "'-----BEGIN ... PRIVATE KEY-----' line and end with the matching "
+            f"'-----END ...' line. Got first line: {lines[0][:40]!r}"
+        )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 class KalshiAuthClient:
     """Sign and send authenticated Kalshi Trade API requests."""
 
@@ -65,9 +90,19 @@ class KalshiAuthClient:
         self.api_key_id = api_key_id.strip()
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._private_key = serialization.load_pem_private_key(
-            private_key_pem, password=None, backend=default_backend()
-        )
+        normalized = _normalize_pem(private_key_pem)
+        try:
+            self._private_key = serialization.load_pem_private_key(
+                normalized, password=None, backend=default_backend()
+            )
+        except (ValueError, TypeError) as exc:
+            head = normalized.split(b"\n", 1)[0].decode("utf-8", "replace")
+            raise KalshiAuthError(
+                f"Could not read the private key ({exc}). "
+                f"Header line looks like: {head!r}. "
+                "Check the key was pasted whole, including the BEGIN and END "
+                "lines, and that it is the .key file Kalshi gave you."
+            ) from exc
 
     @classmethod
     def from_env(cls, env: Optional[dict[str, str]] = None) -> "KalshiAuthClient":
@@ -91,9 +126,16 @@ class KalshiAuthClient:
         pem = (source.get("KALSHI_PRIVATE_KEY_PEM") or "").strip()
         path = (source.get("KALSHI_PRIVATE_KEY_PATH") or "").strip()
         if pem:
-            # Support escaped newlines from Render/env paste
-            private_key_pem = pem.replace("\\n", "\n").encode("utf-8")
+            private_key_pem = pem.encode("utf-8")
         elif path:
+            # Easy mistake: pasting the key itself into the *_PATH variable
+            if path.startswith("-----BEGIN"):
+                raise KalshiAuthError(
+                    "KALSHI_PRIVATE_KEY_PATH contains the key text, not a file "
+                    "path. Either point it at a file (e.g. "
+                    "/etc/secrets/kalshi.key) or put the key in "
+                    "KALSHI_PRIVATE_KEY_PEM instead."
+                )
             key_path = Path(path).expanduser()
             if not key_path.is_file():
                 raise KalshiAuthError(f"Private key file not found: {key_path}")
