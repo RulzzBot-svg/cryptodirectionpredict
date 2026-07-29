@@ -29,6 +29,8 @@ class TelegramNotifier:
             flag = os.getenv("TELEGRAM_ALERTS", "true").strip().lower()
             enabled = flag in {"1", "true", "yes", "on"}
         self.enabled = bool(enabled) and bool(self.token) and bool(self.chat_id)
+        # Set to "LIVE" once real orders are armed so alerts are unmistakable
+        self.prefix = ""
         if enabled and not self.enabled:
             logger.warning(
                 "Telegram alerts requested but TELEGRAM_BOT_TOKEN / "
@@ -42,6 +44,8 @@ class TelegramNotifier:
     def send(self, text: str) -> bool:
         if not self.enabled:
             return False
+        if self.prefix:
+            text = f"[{self.prefix}] {text}"
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = urllib.parse.urlencode(
             {

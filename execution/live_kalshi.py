@@ -45,12 +45,20 @@ class LiveOrderPlan:
     fill_count: float = 0.0
     remaining_count: float = 0.0
     average_fill_price: Optional[float] = None
+    average_fee_paid: Optional[float] = None
     raw_response: Optional[dict[str, Any]] = None
     error: Optional[str] = None
 
     @property
     def filled(self) -> bool:
         return float(self.fill_count) > 0
+
+    @property
+    def effective_price(self) -> Optional[float]:
+        """Fill price plus fee, per contract — the number break-even depends on."""
+        if self.average_fill_price is None:
+            return None
+        return float(self.average_fill_price) + float(self.average_fee_paid or 0.0)
 
 
 class LiveKalshiExecutor:
@@ -217,6 +225,8 @@ class LiveKalshiExecutor:
         rem = float(raw.get("remaining_count") or 0)
         avg = raw.get("average_fill_price")
         avg_f = float(avg) if avg is not None else None
+        fee = raw.get("average_fee_paid")
+        fee_f = float(fee) if fee is not None else None
         return LiveOrderPlan(
             market_ticker=plan.market_ticker,
             advice_side=plan.advice_side,
@@ -232,5 +242,6 @@ class LiveKalshiExecutor:
             fill_count=fill,
             remaining_count=rem,
             average_fill_price=avg_f,
+            average_fee_paid=fee_f,
             raw_response=raw,
         )

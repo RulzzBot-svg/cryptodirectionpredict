@@ -5,7 +5,7 @@ services:
     runtime: python
     plan: starter
     region: oregon
-    branch: cursor/fix-disk-full-1b7a
+    branch: cursor/live-release-1b7a
     buildCommand: pip install -r requirements.txt
     startCommand: bash scripts/start_render.sh
     autoDeploy: true
@@ -54,5 +54,9 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      # Never flip this to "true" on a running service — it wipes the bank.
       - key: RESET_PAPER_HISTORY
-        value: "true"
+        value: "false"
+      # Live trading is additionally hard-gated in code (date + confirm phrase).
+      - key: LIVE_TRADING
+        value: "false"

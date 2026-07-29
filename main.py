@@ -362,6 +362,18 @@ async def run_bot(
         engine=engine,
     )
 
+    if LIVE_TRADING:
+        notifier.prefix = "LIVE"
+        prior = book.get_performance_stats()
+        if prior["settled_count"] > 0:
+            print(
+                f"[{_utcnow_label()}] WARNING: live mode is writing into a book "
+                f"that already holds {prior['settled_count']} settled paper bets. "
+                "Live P/L will be mixed with paper history. Point DATABASE_URL at "
+                "a fresh file (and set PAPER_INITIAL_BALANCE to your Kalshi cash) "
+                "for clean live stats."
+            )
+
     live_exec: Optional[LiveKalshiExecutor] = None
     if LIVE_TRADING or LIVE_DRY_RUN:
         auth_client = None
@@ -645,6 +657,7 @@ async def run_bot(
                 print()
                 # Optional live rehearsal / (gated) live submit
                 live_filled = False
+                live_plan = None
                 if live_exec is not None and advice.entry_share_price is not None:
                     ticker = kalshi_market_ticker.strip()
                     attempts = live_attempts.get(window.window_id, 0)
@@ -673,43 +686,50 @@ async def run_bot(
                                 f"{held:g} on {ticker}"
                             )
                         else:
-                            plan = live_exec.plan_order(
-                                market_ticker=ticker,
-                                advice_side=advice.action,  # type: ignore[arg-type]
-                                share_price=float(advice.entry_share_price),
+                            live_plan = live_exec.execute(
+                                live_exec.plan_order(
+                                    market_ticker=ticker,
+                                    advice_side=advice.action,  # type: ignore[arg-type]
+                                    share_price=float(advice.entry_share_price),
+                                )
                             )
-                            plan = live_exec.execute(plan)
                             live_attempts[window.window_id] = attempts + 1
-                            note = "ORDER" if plan.submitted else "DRY-RUN"
+                            note = "ORDER" if live_plan.submitted else "DRY-RUN"
                             print(
-                                f"[{_utcnow_label()}] LIVE {note} {plan.advice_side} "
-                                f"{plan.book_side} @{plan.yes_book_price*100:.1f}¢ "
-                                f"x{plan.contracts:.2f} {plan.market_ticker} "
+                                f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
+                                f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
+                                f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
                                 f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
-                                + (f" err={plan.error}" if plan.error else "")
+                                + (f" err={live_plan.error}" if live_plan.error else "")
                             )
-                            notifier.live_order_plan(plan, note=note)
-                            live_filled = bool(plan.submitted and plan.filled)
+                            notifier.live_order_plan(live_plan, note=note)
+                            live_filled = bool(live_plan.submitted and live_plan.filled)
                             if live_filled:
                                 live_filled_windows.add(window.window_id)
-                # Paper stays the source of truth until real live is unlocked.
-                # When LIVE_TRADING is armed, skip paper to avoid double-counting.
-                if not LIVE_TRADING:
+                # The book mirrors whatever actually happened: the paper
+                # assumption when papering, the real fill when live. Without
+                # this, live mode would track no W/L, P/L, settlement or vault.
+                record_price: Optional[float] = advice.entry_share_price
+                record_qty: float = STAKE_NOTIONAL
+                if LIVE_TRADING:
+                    # Only a real fill becomes a position; a miss is not a bet.
+                    if live_filled and live_plan is not None:
+                        record_price = live_plan.effective_price
+                        record_qty = float(live_plan.fill_count)
+                    else:
+                        record_price = None
+
+                if record_price is not None and record_qty > 0:
                     placed = book.place_bet(
                         window,
                         advice,
-                        contract_price=advice.entry_share_price,
-                        stake_notional=STAKE_NOTIONAL,
+                        contract_price=record_price,
+                        stake_notional=record_qty,
                     )
                     if placed is not None:
                         notifier.bet_placed(placed, reason=advice.reason)
                         backup_now(database_url=settings.database_url)
                         last_backup_at = datetime.now(timezone.utc).timestamp()
-                elif live_filled:
-                    print(
-                        f"[{_utcnow_label()}] LIVE fill recorded "
-                        "(paper mirror not written in this scaffold)"
-                    )
 
             status_mkt = yes_ask if yes_ask is not None else market_prob_above
             _print_status(
@@ -735,9 +755,20 @@ async def run_bot(
                 and (now_ts - last_heartbeat_at) >= HEARTBEAT_EVERY_SECONDS
             ):
                 stats_hb = book.get_performance_stats()
+                # In live mode the book is a mirror of Kalshi; show both so any
+                # drift between them is visible instead of silent.
+                kalshi_cash = ""
+                if LIVE_TRADING and live_exec is not None and live_exec.client is not None:
+                    try:
+                        kalshi_cash = (
+                            f"Kalshi ${live_exec.client.get_balance().balance_usd:,.2f} | "
+                        )
+                    except KalshiAuthError as exc:
+                        logger.warning("Heartbeat balance check failed: %s", exc)
                 notifier.info(
                     f"HEARTBEAT alive | BTC ${price:,.2f} | "
                     f"{advice.action} edge {advice.edge*100:+.1f}¢ | "
+                    f"{kalshi_cash}"
                     f"Bank ${stats_hb['usd_balance']:,.2f} | "
                     f"Vault ${float(stats_hb.get('vaulted_usd') or 0):,.2f} | "
                     f"{stats_hb['win_count']}W/{stats_hb['loss_count']}L | "

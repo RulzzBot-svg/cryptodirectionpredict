@@ -142,6 +142,23 @@ python scripts/live_smoke_test.py --env prod --i-understand-real-money \
 Capped at 5 contracts and a `--max-cost` ceiling. It never touches
 `LIVE_TRADING` — the bot keeps papering.
 
+**Arming live.** Use a **separate database** so live results aren't mixed into
+paper history, and start the book at your real Kalshi cash:
+
+```
+LIVE_TRADING=true
+LIVE_CONFIRM=YES_I_FINISHED_PAPER_WEEK
+DATABASE_URL=sqlite:////var/data/live_trading.db
+PAPER_INITIAL_BALANCE=108        # your actual Kalshi balance
+```
+
+The bot warns at startup if live mode is writing into a book that already holds
+paper bets. In live mode the book **mirrors real fills** — a bet is recorded
+only when an order actually fills, at the true fill price plus fee, for the
+quantity that filled (partial fills included). Settlement, W/L, P/L, the vault,
+and Telegram all work off that mirror, and the heartbeat shows your real Kalshi
+cash next to it so any drift is visible. Telegram alerts are prefixed `[LIVE]`.
+
 **Missed fills.** Live orders are IOC, so they either fill immediately or die.
 A miss is retried on a later tick (up to `LIVE_MAX_ATTEMPTS`, default 3) but
 only if the edge still clears `MIN_EDGE` against the **current** ask — the bot
