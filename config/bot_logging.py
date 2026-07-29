@@ -13,8 +13,8 @@ from typing import Optional, TextIO
 
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_FILE = "bot.log"
-DEFAULT_MAX_BYTES = 5 * 1024 * 1024
-DEFAULT_BACKUP_COUNT = 5
+DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_BACKUP_COUNT = 2
 
 
 class _TeeTextIO:
@@ -44,8 +44,13 @@ class _TeeTextIO:
             while "\n" in self._file_buf:
                 line, self._file_buf = self._file_buf.split("\n", 1)
                 if line.strip():
-                    self._log_file.write(line.rstrip() + "\n")
-                    self._log_file.flush()
+                    try:
+                        self._log_file.write(line.rstrip() + "\n")
+                        self._log_file.flush()
+                    except OSError:
+                        # Disk full mid-run — keep console output alive
+                        self._file_buf = ""
+                        break
         return len(data)
 
     def flush(self) -> None:
@@ -101,6 +106,20 @@ def _rotate_if_needed(path: Path, *, max_bytes: int, backup_count: int) -> None:
             src.replace(dst)
 
 
+def _emergency_clear_logs(path: Path) -> None:
+    """Last-resort free space so the bot can start after ENOSPC."""
+    parent = path.parent
+    for p in parent.glob(f"{path.name}*"):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def setup_bot_logging(
     *,
     log_path: Optional[Path] = None,
@@ -110,6 +129,8 @@ def setup_bot_logging(
     Tee stdout/stderr into ``logs/bot.log`` and route the logging module there too.
 
     Safe to call once at process start. Returns the log file path.
+    If the disk is full, truncates/rotates aggressively and falls back to
+    console-only logging rather than crash-looping.
     """
     global _configured, _tee_stdout, _tee_stderr, _log_fp
     global _original_stdout, _original_stderr, _log_path
@@ -118,23 +139,52 @@ def setup_bot_logging(
         return _log_path
 
     path = Path(log_path) if log_path is not None else log_path_from_env()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Fall through to console-only below
+        path = Path(os.getenv("LOG_DIR", DEFAULT_LOG_DIR)) / os.getenv(
+            "LOG_FILE", DEFAULT_LOG_FILE
+        )
 
     max_bytes = int(os.getenv("LOG_MAX_BYTES", str(DEFAULT_MAX_BYTES)))
     backup_count = int(os.getenv("LOG_BACKUP_COUNT", str(DEFAULT_BACKUP_COUNT)))
-    _rotate_if_needed(path, max_bytes=max_bytes, backup_count=backup_count)
+    try:
+        _rotate_if_needed(path, max_bytes=max_bytes, backup_count=backup_count)
+    except OSError:
+        _emergency_clear_logs(path)
 
-    _log_fp = open(path, "a", encoding="utf-8", buffering=1)
     started = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    _log_fp.write(f"\n===== bot session start {started} =====\n")
-    _log_fp.flush()
+    try:
+        _log_fp = open(path, "a", encoding="utf-8", buffering=1)
+        _log_fp.write(f"\n===== bot session start {started} =====\n")
+        _log_fp.flush()
+    except OSError as exc:
+        # Disk full — wipe rotated logs / truncate and retry once
+        sys.__stderr__.write(
+            f"[bot.logging] log write failed ({exc}); clearing old logs and retrying\n"
+        )
+        _emergency_clear_logs(path)
+        try:
+            _log_fp = open(path, "w", encoding="utf-8", buffering=1)
+            _log_fp.write(f"\n===== bot session start {started} (after disk prune) =====\n")
+            _log_fp.flush()
+        except OSError as exc2:
+            sys.__stderr__.write(
+                f"[bot.logging] console-only mode (cannot write {path}: {exc2})\n"
+            )
+            _log_fp = None
 
     _original_stdout = sys.stdout
     _original_stderr = sys.stderr
-    _tee_stdout = _TeeTextIO(sys.__stdout__, _log_fp)
-    _tee_stderr = _TeeTextIO(sys.__stderr__, _log_fp)
-    sys.stdout = _tee_stdout
-    sys.stderr = _tee_stderr
+    if _log_fp is not None:
+        _tee_stdout = _TeeTextIO(sys.__stdout__, _log_fp)
+        _tee_stderr = _TeeTextIO(sys.__stderr__, _log_fp)
+        sys.stdout = _tee_stdout
+        sys.stderr = _tee_stderr
+    else:
+        _tee_stdout = None
+        _tee_stderr = None
 
     root = logging.getLogger()
     for handler in list(root.handlers):
@@ -146,7 +196,6 @@ def setup_bot_logging(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    # Single handler through the tee → console + file, no dual file handles
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(level)
@@ -156,7 +205,9 @@ def setup_bot_logging(
     _configured = True
     _log_path = path
 
-    logging.getLogger("bot.logging").info("Writing bot log to %s", path.resolve())
+    logging.getLogger("bot.logging").info(
+        "Writing bot log to %s", path.resolve() if _log_fp else "(console only)"
+    )
     return path
 
 
