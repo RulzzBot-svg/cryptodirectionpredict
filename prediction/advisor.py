@@ -97,14 +97,18 @@ class PredictionAdvisor:
         yes = self._valid_ask(yes_ask)
         no = self._valid_ask(no_ask)
         if yes is None and no is None:
-            mkt = (
-                self.market_prob_above
-                if market_prob_above is None
-                else float(market_prob_above)
-            )
-            yes = self._valid_ask(mkt)
-            if yes is not None:
-                no = self._valid_ask(1.0 - yes)
+            # With no book at all, the reference price is a guess, not a quote.
+            # Inventing one here would manufacture enormous fake edges near
+            # expiry, so only fall back when quotes aren't required (manual mode).
+            if not self.require_tradable_quotes:
+                mkt = (
+                    self.market_prob_above
+                    if market_prob_above is None
+                    else float(market_prob_above)
+                )
+                yes = self._valid_ask(mkt)
+                if yes is not None:
+                    no = self._valid_ask(1.0 - yes)
         elif yes is None and no is not None:
             yes = self._valid_ask(1.0 - no)
         elif no is None and yes is not None:
