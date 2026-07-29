@@ -128,6 +128,20 @@ python scripts/check_live_ready.py   # auth + sample payloads, no orders
 # Optional on a non-Render copy: LIVE_DRY_RUN=true  (Telegram LIVE DRY-RUN pings)
 ```
 
+**Order plumbing smoke test.** Verifies orders actually work before arming the
+bot. Phase 1 places a 1¢ resting bid that cannot fill and cancels it (free);
+phase 2 optionally buys one tiny contract to confirm a real fill.
+
+```bash
+python scripts/live_smoke_test.py                        # demo, cancel test only
+python scripts/live_smoke_test.py --env prod --i-understand-real-money
+python scripts/live_smoke_test.py --env prod --i-understand-real-money \
+    --spend --contracts 1 --max-cost 1.00
+```
+
+Capped at 5 contracts and a `--max-cost` ceiling. It never touches
+`LIVE_TRADING` — the bot keeps papering.
+
 On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 `.key` file on the disk) as secrets — never commit them. Do **not** flip
 `LIVE_TRADING` on the paper worker yet.
