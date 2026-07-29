@@ -138,6 +138,34 @@ class LiveKalshiExecutor:
             dry_run=self.dry_run,
         )
 
+    def get_position_count(self, market_ticker: str) -> Optional[float]:
+        """Contracts currently held on this market.
+
+        Returns 0.0 when flat, a positive count when holding either leg, and
+        ``None`` when the position could not be verified. Callers must treat
+        ``None`` as "do not place" — an unverifiable position is the one case
+        where retrying could double a live bet.
+        """
+        if self.client is None:
+            return None
+        try:
+            payload = self.client.get_positions(ticker=market_ticker)
+        except KalshiAuthError as exc:
+            logger.warning("Position check failed for %s: %s", market_ticker, exc)
+            return None
+
+        markets = payload.get("market_positions") or []
+        total = 0.0
+        for row in markets:
+            if str(row.get("ticker") or "") != market_ticker:
+                continue
+            raw = row.get("position", 0)
+            try:
+                total += abs(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return total
+
     def execute(self, plan: LiveOrderPlan) -> LiveOrderPlan:
         """Submit plan unless dry_run. Returns updated plan with fill info."""
         if plan.dry_run or self.dry_run:

@@ -142,6 +142,13 @@ python scripts/live_smoke_test.py --env prod --i-understand-real-money \
 Capped at 5 contracts and a `--max-cost` ceiling. It never touches
 `LIVE_TRADING` — the bot keeps papering.
 
+**Missed fills.** Live orders are IOC, so they either fill immediately or die.
+A miss is retried on a later tick (up to `LIVE_MAX_ATTEMPTS`, default 3) but
+only if the edge still clears `MIN_EDGE` against the **current** ask — the bot
+never chases the price it originally wanted. Before each live order it checks
+Kalshi for an existing position on that market, so a restart mid-window cannot
+double a bet. If that check fails, the order is skipped rather than risked.
+
 On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 `.key` file on the disk) as secrets — never commit them. Do **not** flip
 `LIVE_TRADING` on the paper worker yet.

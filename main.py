@@ -88,6 +88,9 @@ VAULT_GOAL = float(os.getenv("VAULT_GOAL", "300"))
 # Live scaffold (orders OFF by default; hard-gated until paper week ends)
 LIVE_TRADING = live_trading_requested()
 LIVE_DRY_RUN = live_dry_run_requested()
+# A missed IOC order may be retried on later ticks, but only while the edge
+# still qualifies at the *current* ask — never by chasing the old price.
+LIVE_MAX_ATTEMPTS = int(os.getenv("LIVE_MAX_ATTEMPTS", "3"))
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -419,6 +422,9 @@ async def run_bot(
     kalshi_strike: Optional[float] = None
     kalshi_event: str = ""
     kalshi_market_ticker: str = ""
+    # Per-window live order state (paper book already guards itself)
+    live_attempts: dict[str, int] = {}
+    live_filled_windows: set[str] = set()
     warned_stale_file = False
     last_backup_at = datetime.now(timezone.utc).timestamp()
     last_calibration_at = 0.0
@@ -569,6 +575,8 @@ async def run_bot(
                 kalshi_strike = None
                 kalshi_event = ""
                 kalshi_market_ticker = ""
+                live_attempts.pop(expired.window_id, None)
+                live_filled_windows.discard(expired.window_id)
                 if not market_locked:
                     yes_ask = None
                     no_ask = None
@@ -639,26 +647,51 @@ async def run_bot(
                 live_filled = False
                 if live_exec is not None and advice.entry_share_price is not None:
                     ticker = kalshi_market_ticker.strip()
-                    if ticker:
-                        plan = live_exec.plan_order(
-                            market_ticker=ticker,
-                            advice_side=advice.action,  # type: ignore[arg-type]
-                            share_price=float(advice.entry_share_price),
-                        )
-                        plan = live_exec.execute(plan)
-                        note = "ORDER" if plan.submitted else "DRY-RUN"
-                        print(
-                            f"[{_utcnow_label()}] LIVE {note} {plan.advice_side} "
-                            f"{plan.book_side} @{plan.yes_book_price*100:.1f}¢ "
-                            f"x{plan.contracts:.2f} {plan.market_ticker}"
-                            + (f" err={plan.error}" if plan.error else "")
-                        )
-                        notifier.live_order_plan(plan, note=note)
-                        live_filled = bool(plan.submitted and plan.filled)
+                    attempts = live_attempts.get(window.window_id, 0)
+                    if not ticker:
+                        print(f"[{_utcnow_label()}] LIVE skip — no market ticker yet")
+                    elif window.window_id in live_filled_windows:
+                        pass  # already holding this window; never stack a second bet
+                    elif attempts >= LIVE_MAX_ATTEMPTS:
+                        pass  # gave up on this window; edge will be re-checked next window
                     else:
-                        print(
-                            f"[{_utcnow_label()}] LIVE skip — no market ticker yet"
+                        # Authoritative check: a restart must not double a live bet
+                        held = (
+                            live_exec.get_position_count(ticker)
+                            if LIVE_TRADING
+                            else 0.0
                         )
+                        if held is None:
+                            print(
+                                f"[{_utcnow_label()}] LIVE skip — could not verify "
+                                f"position on {ticker}"
+                            )
+                        elif held > 0:
+                            live_filled_windows.add(window.window_id)
+                            print(
+                                f"[{_utcnow_label()}] LIVE skip — already holding "
+                                f"{held:g} on {ticker}"
+                            )
+                        else:
+                            plan = live_exec.plan_order(
+                                market_ticker=ticker,
+                                advice_side=advice.action,  # type: ignore[arg-type]
+                                share_price=float(advice.entry_share_price),
+                            )
+                            plan = live_exec.execute(plan)
+                            live_attempts[window.window_id] = attempts + 1
+                            note = "ORDER" if plan.submitted else "DRY-RUN"
+                            print(
+                                f"[{_utcnow_label()}] LIVE {note} {plan.advice_side} "
+                                f"{plan.book_side} @{plan.yes_book_price*100:.1f}¢ "
+                                f"x{plan.contracts:.2f} {plan.market_ticker} "
+                                f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
+                                + (f" err={plan.error}" if plan.error else "")
+                            )
+                            notifier.live_order_plan(plan, note=note)
+                            live_filled = bool(plan.submitted and plan.filled)
+                            if live_filled:
+                                live_filled_windows.add(window.window_id)
                 # Paper stays the source of truth until real live is unlocked.
                 # When LIVE_TRADING is armed, skip paper to avoid double-counting.
                 if not LIVE_TRADING:
