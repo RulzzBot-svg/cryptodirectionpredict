@@ -95,7 +95,7 @@ LIVE_TRADING = live_trading_requested()
 LIVE_DRY_RUN = live_dry_run_requested()
 # A missed IOC order may be retried on later ticks, but only while the edge
 # still qualifies at the *current* ask — never by chasing the old price.
-LIVE_MAX_ATTEMPTS = int(os.getenv("LIVE_MAX_ATTEMPTS", "3"))
+LIVE_MAX_ATTEMPTS = int(os.getenv("LIVE_MAX_ATTEMPTS", "5"))
 # Bid this far above the displayed ask so a 1¢ tick doesn't cost the trade.
 # A limit order still pays the best available price, so this only costs money
 # on fills that would otherwise have missed entirely.
