@@ -275,6 +275,22 @@ Shows settled count, W/L, win rate, average price paid, P/L, and ROI on money
 risked — grouped by hour placed, by ABOVE/BELOW, and by entry-price bucket.
 Useful for checking whether a time-of-day effect is real before acting on it.
 
+### Model calibration
+
+The edge only exists if the probabilities are honest — when the model says 27%,
+those bets should win about 27% of the time. If they win materially less, the
+edge is arithmetic on a wrong number and better fills won't help.
+
+```bash
+python scripts/calibration_report.py --db /var/data/live_v4.db
+python scripts/calibration_report.py --db /var/data/paper_trading.db --buckets 5
+```
+
+Reports predicted versus actual win rate per confidence bucket, the Brier
+score, and — most usefully — **edge claimed versus edge realized**. If realized
+edge is near zero while claimed edge is 10¢+, the model is overconfident and
+that's the thing to fix, not execution.
+
 Reset paper W/L anytime:
 
 ```bash
