@@ -55,10 +55,29 @@ class LiveOrderPlan:
 
     @property
     def effective_price(self) -> Optional[float]:
-        """Fill price plus fee, per contract — the number break-even depends on."""
+        """Price actually paid per contract for our side, including fee.
+
+        Kalshi V2 quotes every fill from the YES leg, so a BELOW bet — which is
+        submitted as *selling* YES — reports ``average_fill_price`` as the YES
+        price. What we paid for NO is its complement. Booking the raw number
+        would record a 10¢ NO purchase as a 90¢ one.
+        """
         if self.average_fill_price is None:
             return None
-        return float(self.average_fill_price) + float(self.average_fee_paid or 0.0)
+        fill = float(self.average_fill_price)
+        paid = fill if self.advice_side == "ABOVE" else 1.0 - fill
+        paid += float(self.average_fee_paid or 0.0)
+        if not 0.0 < paid < 1.0:
+            logger.error(
+                "Implausible fill price for %s %s: fill=%s fee=%s -> %s",
+                self.advice_side,
+                self.market_ticker,
+                self.average_fill_price,
+                self.average_fee_paid,
+                paid,
+            )
+            return None
+        return paid
 
 
 class LiveKalshiExecutor:
