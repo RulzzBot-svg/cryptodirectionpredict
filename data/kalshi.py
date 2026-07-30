@@ -127,14 +127,28 @@ class KalshiBook:
 
 
 def _best_bid(levels: Any) -> tuple[Optional[float], float]:
-    """Highest bid and its size from a Kalshi book side ([[price_cents, count]])."""
+    """Highest bid and its size from one side of a Kalshi book.
+
+    Accepts the documented ``[[price_cents, count], ...]`` shape as well as the
+    dict form some responses use, so a format change degrades to "unknown"
+    rather than silently reporting an empty book.
+    """
     best_price: Optional[float] = None
     best_size = 0.0
+    if isinstance(levels, dict):
+        levels = levels.get("levels") or levels.get("orders") or []
     for level in levels or []:
-        if not isinstance(level, (list, tuple)) or len(level) < 2:
-            continue
-        price = _parse_float(level[0])
-        size = _parse_float(level[1])
+        price = size = None
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _parse_float(level[0])
+            size = _parse_float(level[1])
+        elif isinstance(level, dict):
+            price = _parse_float(
+                level.get("price", level.get("price_cents", level.get("p")))
+            )
+            size = _parse_float(
+                level.get("count", level.get("quantity", level.get("size", level.get("q"))))
+            )
         if price is None or size is None or size <= 0:
             continue
         if best_price is None or price > best_price:
@@ -162,9 +176,18 @@ def fetch_orderbook(
         logger.warning("Kalshi orderbook fetch failed (%s): %s", ticker, exc)
         return None
 
-    book = payload.get("orderbook") or {}
+    book = payload.get("orderbook") or payload or {}
     yes_bid, yes_bid_size = _best_bid(book.get("yes"))
     no_bid, no_bid_size = _best_bid(book.get("no"))
+    if yes_bid is None and no_bid is None:
+        # Never seen in testing; log the shape once so a format change is
+        # diagnosable instead of looking like an empty market.
+        logger.warning(
+            "Kalshi orderbook for %s parsed as empty; keys=%s sample=%.200s",
+            ticker,
+            list(book.keys()) if isinstance(book, dict) else type(book).__name__,
+            json.dumps(payload)[:200],
+        )
 
     # Buying YES lifts the best NO bid at its complement (prices are in cents)
     yes_ask = (100.0 - no_bid) / 100.0 if no_bid is not None else None

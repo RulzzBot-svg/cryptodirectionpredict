@@ -398,11 +398,11 @@ async def run_bot(
         prior = book.get_performance_stats()
         if prior["settled_count"] > 0:
             print(
-                f"[{_utcnow_label()}] WARNING: live mode is writing into a book "
-                f"that already holds {prior['settled_count']} settled paper bets. "
-                "Live P/L will be mixed with paper history. Point DATABASE_URL at "
-                "a fresh file (and set PAPER_INITIAL_BALANCE to your Kalshi cash) "
-                "for clean live stats."
+                f"[{_utcnow_label()}] Live mode resuming a book with "
+                f"{prior['settled_count']} settled bets "
+                f"(bank ${prior['usd_balance']:,.2f}). If this database was "
+                "used for paper, point DATABASE_URL at a fresh file so live "
+                "stats stay clean."
             )
 
     live_exec: Optional[LiveKalshiExecutor] = None
@@ -738,11 +738,10 @@ async def run_bot(
                                     model_now - true_ask if true_ask is not None else None
                                 )
                                 if true_ask is None:
-                                    send_order = False
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE skip — no "
-                                        f"{advice.action} offer on the book"
-                                    )
+                                    # Unreadable book is not evidence of a bad
+                                    # price. Fall back to the snapshot rather
+                                    # than refusing to trade at all.
+                                    depth_note = " (book unreadable, using snapshot)"
                                 elif fresh_edge is not None and fresh_edge < MIN_EDGE:
                                     send_order = False
                                     print(

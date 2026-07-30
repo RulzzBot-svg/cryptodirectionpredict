@@ -164,8 +164,14 @@ A miss is retried on a later tick (up to `LIVE_MAX_ATTEMPTS`, default 3) but
 only if the edge still clears `MIN_EDGE` against the **current** ask — the bot
 never chases the price it originally wanted.
 
-Orders are placed `LIVE_PRICE_TOLERANCE_CENTS` (default 1¢) above the displayed
-ask so a single tick doesn't cost the trade. Because these are limit orders you
+Immediately before each live order the bot pulls the **real orderbook** for
+that market rather than trusting the market snapshot's derived `yes_ask`, which
+lags. Kalshi's book lists bids on both legs, so the true cost to buy ABOVE is
+`1 − best NO bid`. The edge is re-checked at that real price and the order is
+abandoned if it no longer clears `MIN_EDGE`.
+
+Orders are placed `LIVE_PRICE_TOLERANCE_CENTS` (default 1¢) above the ask
+so a single tick doesn't cost the trade. Because these are limit orders you
 still pay the **best available** price, so the tolerance only costs anything on
 fills that would otherwise have missed — and the bid is capped so the edge never
 drops below `MIN_EDGE`. Fill rate is printed after each order and included in
