@@ -41,7 +41,11 @@ from config.settings import load_settings
 from data.backup import backup_now, restore_latest_backup
 from data.calibration import CalibrationLog
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
-from data.kalshi import fetch_current_btc_15m, fetch_window_settlement
+from data.kalshi import (
+    fetch_current_btc_15m,
+    fetch_orderbook,
+    fetch_window_settlement,
+)
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
 from execution.live_kalshi import LiveKalshiExecutor
 from execution.prediction_book import PredictionBook
@@ -716,48 +720,85 @@ async def run_bot(
                             )
                         else:
                             ask_now = float(advice.entry_share_price)
-                            model_now = (
+                            model_now = float(
                                 advice.prob_above
                                 if advice.action == "ABOVE"
                                 else advice.prob_below
                             )
-                            bid_price = _limit_price_with_tolerance(
-                                ask=ask_now, model_prob=float(model_now)
+                            # The snapshot ask is derived and often stale. Price
+                            # off the real book instead, fetched right now.
+                            book_now = await asyncio.to_thread(
+                                fetch_orderbook, ticker
                             )
-                            live_plan = live_exec.execute(
-                                live_exec.plan_order(
-                                    market_ticker=ticker,
-                                    advice_side=advice.action,  # type: ignore[arg-type]
-                                    share_price=bid_price,
+                            depth_note = ""
+                            send_order = True
+                            if book_now is not None:
+                                true_ask = book_now.ask_for(advice.action)
+                                fresh_edge = (
+                                    model_now - true_ask if true_ask is not None else None
                                 )
-                            )
-                            live_attempts[window.window_id] = attempts + 1
-                            note = "ORDER" if live_plan.submitted else "DRY-RUN"
-                            pad = ""
-                            if bid_price > ask_now:
-                                pad = f" (ask {ask_now*100:.0f}¢ +{(bid_price-ask_now)*100:.0f}¢)"
-                            print(
-                                f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
-                                f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
-                                f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
-                                f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS}){pad}"
-                                + (f" err={live_plan.error}" if live_plan.error else "")
-                            )
-                            notifier.live_order_plan(live_plan, note=note)
-                            live_filled = bool(live_plan.submitted and live_plan.filled)
-                            if live_plan.submitted:
-                                if live_filled:
-                                    live_fill_count += 1
+                                if true_ask is None:
+                                    send_order = False
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — no "
+                                        f"{advice.action} offer on the book"
+                                    )
+                                elif fresh_edge is not None and fresh_edge < MIN_EDGE:
+                                    send_order = False
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — edge gone "
+                                        f"at real ask {true_ask*100:.0f}¢ "
+                                        f"(snapshot said {ask_now*100:.0f}¢, "
+                                        f"edge {fresh_edge*100:+.1f}¢)"
+                                    )
                                 else:
-                                    live_miss_count += 1
-                                total_orders = live_fill_count + live_miss_count
-                                print(
-                                    f"[{_utcnow_label()}] LIVE fill rate "
-                                    f"{live_fill_count}/{total_orders} "
-                                    f"({live_fill_count / total_orders * 100:.0f}%)"
+                                    depth = book_now.depth_for(advice.action)
+                                    depth_note = f" book {true_ask*100:.0f}¢ x{depth:g}"
+                                    ask_now = true_ask
+
+                            if not send_order:
+                                live_attempts[window.window_id] = attempts + 1
+                            else:
+                                bid_price = _limit_price_with_tolerance(
+                                    ask=ask_now, model_prob=model_now
                                 )
-                            if live_filled:
-                                live_filled_windows.add(window.window_id)
+                                live_plan = live_exec.execute(
+                                    live_exec.plan_order(
+                                        market_ticker=ticker,
+                                        advice_side=advice.action,  # type: ignore[arg-type]
+                                        share_price=bid_price,
+                                    )
+                                )
+                                live_attempts[window.window_id] = attempts + 1
+                                note = "ORDER" if live_plan.submitted else "DRY-RUN"
+                                pad = ""
+                                if bid_price > ask_now:
+                                    pad = (
+                                        f" (ask {ask_now*100:.0f}¢ "
+                                        f"+{(bid_price-ask_now)*100:.0f}¢)"
+                                    )
+                                print(
+                                    f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
+                                    f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
+                                    f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
+                                    f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS}){pad}{depth_note}"
+                                    + (f" err={live_plan.error}" if live_plan.error else "")
+                                )
+                                notifier.live_order_plan(live_plan, note=note)
+                                live_filled = bool(live_plan.submitted and live_plan.filled)
+                                if live_plan.submitted:
+                                    if live_filled:
+                                        live_fill_count += 1
+                                    else:
+                                        live_miss_count += 1
+                                    total_orders = live_fill_count + live_miss_count
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE fill rate "
+                                        f"{live_fill_count}/{total_orders} "
+                                        f"({live_fill_count / total_orders * 100:.0f}%)"
+                                    )
+                                if live_filled:
+                                    live_filled_windows.add(window.window_id)
                 # The book mirrors whatever actually happened: the paper
                 # assumption when papering, the real fill when live. Without
                 # this, live mode would track no W/L, P/L, settlement or vault.

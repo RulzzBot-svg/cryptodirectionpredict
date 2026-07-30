@@ -103,6 +103,88 @@ class KalshiBtcWindow:
         )
 
 
+@dataclass(frozen=True)
+class KalshiBook:
+    """Best executable prices from the real orderbook, with available size.
+
+    Kalshi's book lists *bids* on both legs. Buying YES means lifting the best
+    NO bid at its complement, and vice versa — so the true ask for one side is
+    ``1 - best_bid`` of the other.
+    """
+
+    ticker: str
+    yes_ask: Optional[float]
+    yes_ask_depth: float
+    no_ask: Optional[float]
+    no_ask_depth: float
+    raw: dict[str, Any]
+
+    def ask_for(self, side: str) -> Optional[float]:
+        return self.yes_ask if side == "ABOVE" else self.no_ask
+
+    def depth_for(self, side: str) -> float:
+        return self.yes_ask_depth if side == "ABOVE" else self.no_ask_depth
+
+
+def _best_bid(levels: Any) -> tuple[Optional[float], float]:
+    """Highest bid and its size from a Kalshi book side ([[price_cents, count]])."""
+    best_price: Optional[float] = None
+    best_size = 0.0
+    for level in levels or []:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        price = _parse_float(level[0])
+        size = _parse_float(level[1])
+        if price is None or size is None or size <= 0:
+            continue
+        if best_price is None or price > best_price:
+            best_price = price
+            best_size = size
+    return best_price, best_size
+
+
+def fetch_orderbook(
+    ticker: str,
+    *,
+    base_url: str = DEFAULT_BASE_URL,
+    depth: int = 10,
+    timeout: float = 8.0,
+) -> Optional[KalshiBook]:
+    """Live orderbook for one market. Returns None if it can't be read."""
+    if not ticker:
+        return None
+    url = f"{base_url.rstrip('/')}/markets/{urllib.parse.quote(ticker)}/orderbook"
+    if depth:
+        url = f"{url}?depth={int(depth)}"
+    try:
+        payload = _request_json(url, timeout=timeout)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("Kalshi orderbook fetch failed (%s): %s", ticker, exc)
+        return None
+
+    book = payload.get("orderbook") or {}
+    yes_bid, yes_bid_size = _best_bid(book.get("yes"))
+    no_bid, no_bid_size = _best_bid(book.get("no"))
+
+    # Buying YES lifts the best NO bid at its complement (prices are in cents)
+    yes_ask = (100.0 - no_bid) / 100.0 if no_bid is not None else None
+    no_ask = (100.0 - yes_bid) / 100.0 if yes_bid is not None else None
+
+    def _sane(price: Optional[float]) -> Optional[float]:
+        if price is None or price <= 0.0 or price >= 1.0:
+            return None
+        return price
+
+    return KalshiBook(
+        ticker=ticker,
+        yes_ask=_sane(yes_ask),
+        yes_ask_depth=no_bid_size,
+        no_ask=_sane(no_ask),
+        no_ask_depth=yes_bid_size,
+        raw=payload,
+    )
+
+
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
