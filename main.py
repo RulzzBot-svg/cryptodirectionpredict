@@ -477,6 +477,13 @@ async def run_bot(
     live_fill_count = 0
     live_miss_count = 0
     resting: Optional[RestingOrder] = None
+    # Why the bot didn't bet, counted per window. Without this a bot that is
+    # correctly declining every price looks identical to a frozen one.
+    skip_counts: dict[str, int] = {}
+
+    def note_skip(reason: str) -> None:
+        skip_counts[reason] = skip_counts.get(reason, 0) + 1
+
     # Advice/window captured when the order was placed — the model view may have
     # moved on by the time it fills, but the bet belongs to the original call.
     resting_advice: Any = None
@@ -613,7 +620,14 @@ async def run_bot(
                     notifier.vault_withdrawal(vault_event)
                 stats = book.get_performance_stats()
                 _print_window_performance(stats)
-                notifier.window_stats(stats)
+                skip_summary = ", ".join(
+                    f"{count}× {reason}"
+                    for reason, count in sorted(
+                        skip_counts.items(), key=lambda kv: -kv[1]
+                    )
+                )
+                notifier.window_stats(stats, skips=skip_summary)
+                skip_counts.clear()
                 calibration.log_settle(
                     window_id=expired.window_id,
                     symbol=symbol,
@@ -765,11 +779,12 @@ async def run_bot(
                     ticker = kalshi_market_ticker.strip()
                     attempts = live_attempts.get(window.window_id, 0)
                     if not ticker:
+                        note_skip("no ticker")
                         print(f"[{_utcnow_label()}] LIVE skip — no market ticker yet")
                     elif window.window_id in live_filled_windows:
-                        pass  # already holding this window; never stack a second bet
+                        note_skip("already holding")
                     elif attempts >= LIVE_MAX_ATTEMPTS:
-                        pass  # gave up on this window; edge will be re-checked next window
+                        note_skip("attempts used")
                     else:
                         # Authoritative check: a restart must not double a live bet
                         held = (
@@ -778,11 +793,13 @@ async def run_bot(
                             else 0.0
                         )
                         if held is None:
+                            note_skip("position check failed")
                             print(
                                 f"[{_utcnow_label()}] LIVE skip — could not verify "
                                 f"position on {ticker}"
                             )
                         elif held > 0:
+                            note_skip("already holding")
                             live_filled_windows.add(window.window_id)
                             print(
                                 f"[{_utcnow_label()}] LIVE skip — already holding "
@@ -814,6 +831,7 @@ async def run_bot(
                                     depth_note = " (book unreadable, using snapshot)"
                                 elif fresh_edge is not None and fresh_edge < MIN_EDGE:
                                     send_order = False
+                                    note_skip("edge gone on real book")
                                     print(
                                         f"[{_utcnow_label()}] LIVE skip — edge gone "
                                         f"at real ask {true_ask*100:.0f}¢ "
@@ -828,10 +846,40 @@ async def run_bot(
                             if not send_order:
                                 live_attempts[window.window_id] = attempts + 1
                             elif LIVE_ORDER_MODE == "maker":
-                                # Rest at the far side of the spread and let the
-                                # market come to us. Never cross — post_only.
-                                rest_price = min(ask_now, model_now - MIN_EDGE)
+                                # A maker order sits on the BID. Resting at the
+                                # ask would cross, and post_only would reject it.
+                                best_bid = (
+                                    book_now.bid_for(advice.action)
+                                    if book_now is not None
+                                    else None
+                                )
+                                if best_bid is None:
+                                    note_skip("no bid to join")
+                                    live_attempts[window.window_id] = attempts + 1
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — no "
+                                        f"{advice.action} bid to join on {ticker}"
+                                    )
+                                    await asyncio.sleep(LOOP_INTERVAL_SECONDS)
+                                    continue
+                                # Improve on the best bid by a tick when the
+                                # spread allows, but never reach the ask.
+                                rest_price = min(
+                                    best_bid + 0.01,
+                                    ask_now - 0.01,
+                                    model_now - MIN_EDGE,
+                                )
                                 rest_price = math.floor(rest_price * 100.0) / 100.0
+                                if rest_price < 0.01:
+                                    note_skip("no maker price with edge")
+                                    live_attempts[window.window_id] = attempts + 1
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — no maker "
+                                        f"price leaves {MIN_EDGE*100:.0f}¢ edge "
+                                        f"(bid {best_bid*100:.0f}¢ ask {ask_now*100:.0f}¢)"
+                                    )
+                                    await asyncio.sleep(LOOP_INTERVAL_SECONDS)
+                                    continue
                                 resting = await asyncio.to_thread(
                                     live_exec.place_resting,
                                     market_ticker=ticker,

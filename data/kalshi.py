@@ -118,9 +118,16 @@ class KalshiBook:
     no_ask: Optional[float]
     no_ask_depth: float
     raw: dict[str, Any]
+    yes_bid: Optional[float] = None
+    no_bid: Optional[float] = None
 
     def ask_for(self, side: str) -> Optional[float]:
+        """Price to buy this side right now (crossing the spread)."""
         return self.yes_ask if side == "ABOVE" else self.no_ask
+
+    def bid_for(self, side: str) -> Optional[float]:
+        """Best resting bid for this side — where a maker order must sit."""
+        return self.yes_bid if side == "ABOVE" else self.no_bid
 
     def depth_for(self, side: str) -> float:
         return self.yes_ask_depth if side == "ABOVE" else self.no_ask_depth
@@ -227,6 +234,8 @@ def fetch_orderbook(
         no_ask=_sane(no_ask),
         no_ask_depth=yes_bid_size,
         raw=payload,
+        yes_bid=_sane(yes_bid),
+        no_bid=_sane(no_bid),
     )
 
 

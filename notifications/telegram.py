@@ -99,7 +99,7 @@ class TelegramNotifier:
         )
         self.send(msg)
 
-    def window_stats(self, stats: dict[str, Any]) -> None:
+    def window_stats(self, stats: dict[str, Any], *, skips: str = "") -> None:
         pnl = float(stats.get("total_pnl") or 0.0)
         sign = "+" if pnl >= 0 else "-"
         vaulted = float(stats.get("vaulted_usd") or 0.0)
@@ -114,6 +114,8 @@ class TelegramNotifier:
             f"({float(stats.get('win_rate_pct') or 0):.1f}%) | "
             f"Settled {stats.get('settled_count', 0)}"
         )
+        if skips:
+            msg += f"\nNo bet: {skips}"
         self.send(msg)
 
     def vault_withdrawal(self, event: Any) -> None:
