@@ -47,6 +47,7 @@ from data.kalshi import (
     fetch_window_settlement,
 )
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
+from data.price_tape import PriceTape
 from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
@@ -106,6 +107,15 @@ LIVE_PRICE_TOLERANCE = float(os.getenv("LIVE_PRICE_TOLERANCE_CENTS", "1")) / 100
 #          adverse selection. Short expiry keeps the quote from going stale.
 LIVE_ORDER_MODE = os.getenv("LIVE_ORDER_MODE", "taker").strip().lower()
 LIVE_REST_SECONDS = float(os.getenv("LIVE_REST_SECONDS", "45"))
+# Stream spot instead of reading it over REST once a loop. Any edge against
+# Kalshi depends on our price being fresher than theirs, not older.
+SPOT_STREAM = os.getenv("SPOT_STREAM", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SPOT_MAX_AGE_SECONDS = float(os.getenv("SPOT_MAX_AGE_SECONDS", "3"))
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -151,11 +161,15 @@ def _print_status(
     edge: float,
     bankroll: float,
     market_prob: float,
+    spot_source: str = "rest",
 ) -> None:
     src = {"manual": "RH", "kalshi": "KL", "auto": "auto"}.get(strike_source, strike_source)
+    spot_tag = {"websocket": "ws", "rest-fallback": "rest*", "rest": "rest"}.get(
+        spot_source, spot_source
+    )
     line = (
         f"[{_utcnow_label()}] "
-        f"BTC ${price:,.2f} | "
+        f"BTC ${price:,.2f} ({spot_tag}) | "
         f"Strike ${strike:,.2f} ({src}) | "
         f"T-{_fmt_mmss(remaining)} | "
         f"Above {p_above * 100:5.2f}% | "
@@ -464,6 +478,17 @@ async def run_bot(
             f"face ${STAKE_NOTIONAL:g} | {vault_txt} | series {KALSHI_SERIES}"
         )
 
+    tape: Optional[PriceTape] = None
+    if SPOT_STREAM:
+        tape = PriceTape(
+            symbol, provider=provider, max_age_seconds=SPOT_MAX_AGE_SECONDS
+        )
+        await tape.start()
+        print(
+            f"[{_utcnow_label()}] Spot stream starting "
+            f"(fall back to REST if older than {SPOT_MAX_AGE_SECONDS:g}s)"
+        )
+
     exchange: Any = None
     consecutive_errors = 0
     last_announced_strike: Optional[float] = None
@@ -567,6 +592,14 @@ async def run_bot(
                 continue
 
             price = float(snapshot["last_price"] or 0.0)
+            # Prefer the streamed price — a REST snapshot can be seconds old,
+            # and an edge measured against a stale spot is our lag, not Kalshi's.
+            spot_source = "rest"
+            if tape is not None:
+                streamed = tape.fresh_price()
+                if streamed is not None and streamed > 0:
+                    price = streamed
+                    spot_source = tape.transport
             if price <= 0:
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
@@ -999,6 +1032,7 @@ async def run_bot(
                 edge=advice.edge,
                 bankroll=book.get_balance(),
                 market_prob=status_mkt if status_mkt is not None else 0.0,
+                spot_source=spot_source,
             )
 
             if (now_ts - last_backup_at) >= BACKUP_EVERY_SECONDS:
@@ -1013,24 +1047,27 @@ async def run_bot(
                 stats_hb = book.get_performance_stats()
                 # In live mode the book is a mirror of Kalshi; show both so any
                 # drift between them is visible instead of silent.
-                kalshi_cash = ""
+                extras = ""
+                if tape is not None:
+                    age = tape.age_seconds
+                    age_txt = f"{age:.1f}s" if age is not None else "n/a"
+                    extras += f"Spot {tape.transport} {age_txt} | "
                 if LIVE_TRADING and live_exec is not None and live_exec.client is not None:
                     try:
-                        kalshi_cash = (
-                            f"Kalshi ${live_exec.client.get_balance().balance_usd:,.2f} | "
-                        )
+                        balance = live_exec.client.get_balance().balance_usd
+                        extras += f"Kalshi ${balance:,.2f} | "
                     except KalshiAuthError as exc:
                         logger.warning("Heartbeat balance check failed: %s", exc)
                     orders_sent = live_fill_count + live_miss_count
                     if orders_sent:
-                        kalshi_cash += (
+                        extras += (
                             f"Fills {live_fill_count}/{orders_sent} "
                             f"({live_fill_count / orders_sent * 100:.0f}%) | "
                         )
                 notifier.info(
                     f"HEARTBEAT alive | BTC ${price:,.2f} | "
                     f"{advice.action} edge {advice.edge*100:+.1f}¢ | "
-                    f"{kalshi_cash}"
+                    f"{extras}"
                     f"Bank ${stats_hb['usd_balance']:,.2f} | "
                     f"Vault ${float(stats_hb.get('vaulted_usd') or 0):,.2f} | "
                     f"{stats_hb['win_count']}W/{stats_hb['loss_count']}L | "
@@ -1040,6 +1077,8 @@ async def run_bot(
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
+        if tape is not None:
+            await tape.stop()
         if resting is not None and live_exec is not None:
             # Don't leave a live order on the book after the process stops
             try:
