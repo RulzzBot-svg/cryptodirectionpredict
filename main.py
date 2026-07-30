@@ -808,6 +808,20 @@ async def run_bot(
                     if live_filled and live_plan is not None:
                         record_price = live_plan.effective_price
                         record_qty = float(live_plan.fill_count)
+                        # A fill should cost roughly what we bid. A large gap
+                        # means the price was read off the wrong leg.
+                        intended = float(live_plan.share_price)
+                        if (
+                            record_price is not None
+                            and abs(record_price - intended) > 0.10
+                        ):
+                            print(
+                                f"[{_utcnow_label()}] WARNING: booked "
+                                f"{record_price*100:.1f}¢ for a {intended*100:.1f}¢ "
+                                f"{live_plan.advice_side} order — not recording. "
+                                "Check fill-price handling."
+                            )
+                            record_price = None
                     else:
                         record_price = None
 
