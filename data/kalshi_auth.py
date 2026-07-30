@@ -261,6 +261,26 @@ class KalshiAuthClient:
             )
         return response.json()
 
+    def get_fills(
+        self,
+        *,
+        ticker: Optional[str] = None,
+        order_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """GET /portfolio/fills — executed trades, with the price actually paid."""
+        params: dict[str, Any] = {"limit": max(1, min(1000, int(limit)))}
+        if ticker:
+            params["ticker"] = ticker
+        if order_id:
+            params["order_id"] = order_id
+        response = self.request("GET", "/portfolio/fills", params=params)
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Fills failed ({response.status_code}): {response.text[:300]}"
+            )
+        return response.json()
+
     def get_orders(self, *, ticker: Optional[str] = None, status: Optional[str] = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if ticker:

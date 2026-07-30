@@ -171,7 +171,20 @@ lags. Kalshi's book lists bids on both legs, so the true cost to buy ABOVE is
 abandoned if it no longer clears `MIN_EDGE`.
 
 Orders are placed `LIVE_PRICE_TOLERANCE_CENTS` (default 1¢) above the ask
-so a single tick doesn't cost the trade. Because these are limit orders you
+so a single tick doesn't cost the trade.
+
+**Taker vs maker (`LIVE_ORDER_MODE`).** The default `taker` mode crosses the
+spread with an IOC order: it fills instantly or not at all, and pays the full
+`0.07 × C × P × (1−P)` fee. Setting `maker` instead rests a **post-only** limit
+order on the book for `LIVE_REST_SECONDS` (default 45) and lets the market come
+to it. That trades instant execution for a much longer window to get hit, at
+roughly a **quarter of the fee**.
+
+The trade-off is adverse selection — a resting bid tends to get filled exactly
+when the price is moving against it. The short expiry limits how stale the
+quote can get, orders are cancelled when the window rolls or the bot stops, and
+`post_only` guarantees it never accidentally crosses. Compare the two modes at
+1 contract before trusting either. Because these are limit orders you
 still pay the **best available** price, so the tolerance only costs anything on
 fills that would otherwise have missed — and the bid is capped so the edge never
 drops below `MIN_EDGE`. Fill rate is printed after each order and included in

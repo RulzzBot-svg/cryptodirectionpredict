@@ -47,7 +47,7 @@ from data.kalshi import (
     fetch_window_settlement,
 )
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
-from execution.live_kalshi import LiveKalshiExecutor
+from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
 from notifications import TelegramNotifier
@@ -100,6 +100,12 @@ LIVE_MAX_ATTEMPTS = int(os.getenv("LIVE_MAX_ATTEMPTS", "3"))
 # A limit order still pays the best available price, so this only costs money
 # on fills that would otherwise have missed entirely.
 LIVE_PRICE_TOLERANCE = float(os.getenv("LIVE_PRICE_TOLERANCE_CENTS", "1")) / 100.0
+# taker  = cross the spread now (IOC), fills instantly or not at all
+# maker  = rest a post-only limit and let the market come to us. Higher fill
+#          rate over a 15m window and a quarter of the fee, at the cost of
+#          adverse selection. Short expiry keeps the quote from going stale.
+LIVE_ORDER_MODE = os.getenv("LIVE_ORDER_MODE", "taker").strip().lower()
+LIVE_REST_SECONDS = float(os.getenv("LIVE_REST_SECONDS", "45"))
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -470,6 +476,11 @@ async def run_bot(
     live_filled_windows: set[str] = set()
     live_fill_count = 0
     live_miss_count = 0
+    resting: Optional[RestingOrder] = None
+    # Advice/window captured when the order was placed — the model view may have
+    # moved on by the time it fills, but the bet belongs to the original call.
+    resting_advice: Any = None
+    resting_window: Any = None
     warned_stale_file = False
     last_backup_at = datetime.now(timezone.utc).timestamp()
     last_calibration_at = 0.0
@@ -622,6 +633,17 @@ async def run_bot(
                 kalshi_market_ticker = ""
                 live_attempts.pop(expired.window_id, None)
                 live_filled_windows.discard(expired.window_id)
+                if resting is not None and live_exec is not None:
+                    # Never let an order outlive the window it was priced for
+                    await asyncio.to_thread(live_exec.cancel_resting, resting)
+                    print(
+                        f"[{_utcnow_label()}] LIVE cancelled resting order "
+                        f"at window close ({resting.advice_side} "
+                        f"@{resting.limit_price*100:.0f}¢)"
+                    )
+                    resting = None
+                    resting_advice = None
+                    resting_window = None
                 if not market_locked:
                     yes_ask = None
                     no_ask = None
@@ -686,7 +708,55 @@ async def run_bot(
                 last_calibration_at = now_ts
                 last_cal_window = window.window_id
 
-            if AUTO_BET and advice.should_bet and book.get_open_bet(window.window_id) is None:
+            # A resting order may have been hit since the last tick.
+            if resting is not None and live_exec is not None:
+                rest_fill = await asyncio.to_thread(live_exec.poll_resting, resting)
+                if rest_fill is not None:
+                    live_filled_windows.add(resting.window_id)
+                    live_fill_count += 1
+                    print(
+                        f"[{_utcnow_label()}] LIVE RESTING FILLED "
+                        f"{resting.advice_side} {rest_fill.contracts:g} @ "
+                        f"{rest_fill.price_paid*100:.1f}¢ (cost ${rest_fill.cost:.2f})"
+                    )
+                    if (
+                        resting_advice is not None
+                        and resting_window is not None
+                        and book.get_open_bet(resting.window_id) is None
+                    ):
+                        placed = book.place_bet(
+                            resting_window,
+                            resting_advice,
+                            contract_price=rest_fill.price_paid,
+                            stake_notional=rest_fill.contracts,
+                        )
+                        if placed is not None:
+                            notifier.bet_placed(placed, reason=resting_advice.reason)
+                            backup_now(database_url=settings.database_url)
+                            last_backup_at = datetime.now(timezone.utc).timestamp()
+                    resting = None
+                    resting_advice = None
+                    resting_window = None
+                elif resting.is_expired() or resting.window_id != window.window_id:
+                    await asyncio.to_thread(live_exec.cancel_resting, resting)
+                    live_miss_count += 1
+                    total_orders = live_fill_count + live_miss_count
+                    print(
+                        f"[{_utcnow_label()}] LIVE resting expired unfilled "
+                        f"({resting.advice_side} @{resting.limit_price*100:.0f}¢) | "
+                        f"fill rate {live_fill_count}/{total_orders} "
+                        f"({live_fill_count / total_orders * 100:.0f}%)"
+                    )
+                    resting = None
+                    resting_advice = None
+                    resting_window = None
+
+            if (
+                AUTO_BET
+                and advice.should_bet
+                and resting is None
+                and book.get_open_bet(window.window_id) is None
+            ):
                 print()
                 # Optional live rehearsal / (gated) live submit
                 live_filled = False
@@ -757,6 +827,37 @@ async def run_bot(
 
                             if not send_order:
                                 live_attempts[window.window_id] = attempts + 1
+                            elif LIVE_ORDER_MODE == "maker":
+                                # Rest at the far side of the spread and let the
+                                # market come to us. Never cross — post_only.
+                                rest_price = min(ask_now, model_now - MIN_EDGE)
+                                rest_price = math.floor(rest_price * 100.0) / 100.0
+                                resting = await asyncio.to_thread(
+                                    live_exec.place_resting,
+                                    market_ticker=ticker,
+                                    window_id=window.window_id,
+                                    advice_side=advice.action,
+                                    share_price=rest_price,
+                                    rest_seconds=LIVE_REST_SECONDS,
+                                )
+                                live_attempts[window.window_id] = attempts + 1
+                                if resting is None:
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE rest rejected "
+                                        f"{advice.action} @{rest_price*100:.0f}¢ "
+                                        f"{ticker}{depth_note}"
+                                    )
+                                else:
+                                    resting_advice = advice
+                                    resting_window = window
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE RESTING "
+                                        f"{advice.action} @{rest_price*100:.0f}¢ "
+                                        f"x{resting.contracts:g} {ticker} "
+                                        f"for {LIVE_REST_SECONDS:.0f}s "
+                                        f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
+                                        f"{depth_note}"
+                                    )
                             else:
                                 bid_price = _limit_price_with_tolerance(
                                     ask=ask_now, model_prob=model_now
@@ -890,6 +991,13 @@ async def run_bot(
 
             await asyncio.sleep(LOOP_INTERVAL_SECONDS)
     finally:
+        if resting is not None and live_exec is not None:
+            # Don't leave a live order on the book after the process stops
+            try:
+                await asyncio.to_thread(live_exec.cancel_resting, resting)
+                print(f"[{_utcnow_label()}] Cancelled resting order on shutdown")
+            except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+                logger.warning("Could not cancel resting order: %s", exc)
         await close_exchange(exchange)
         backup_now(database_url=settings.database_url)
         final_stats = book.get_performance_stats()
