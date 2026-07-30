@@ -94,6 +94,18 @@ Terminal output (status ticks, bets, settlements) is also appended to
 Settlement prefers the **official Kalshi YES/NO result** when available,
 falling back to Coinbase spot otherwise.
 
+### Spot price freshness
+
+The edge depends on Kalshi lagging the spot market, so our own spot has to be
+fresher than theirs. Reading it over REST once per loop leaves it up to
+`LOOP_INTERVAL_SECONDS` old — old enough that the apparent mispricing is our own
+staleness. `SPOT_STREAM=true` (default) keeps a WebSocket price tape in memory,
+typically sub-second, and falls back to the REST snapshot if it goes older than
+`SPOT_MAX_AGE_SECONDS`.
+
+The status line tags which source was used: `BTC $64,722.21 (ws)` versus
+`(rest)`, and the heartbeat reports the tape's age.
+
 ### Kalshi cash-out + API prep (before live)
 
 **Saving profits early is the right move.** On real Kalshi money: leave a fixed
