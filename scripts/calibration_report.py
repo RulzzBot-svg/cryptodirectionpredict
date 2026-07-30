@@ -69,20 +69,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=5,
         help="Hide buckets with fewer settled bets than this",
     )
+    parser.add_argument(
+        "--since",
+        help=(
+            "Only bets placed at/after this UTC time, e.g. '2026-07-30 22:00'. "
+            "Useful for separating regimes after a change to how prices are read."
+        ),
+    )
+    parser.add_argument(
+        "--until",
+        help="Only bets placed before this UTC time",
+    )
     args = parser.parse_args(argv)
 
     db_path = _resolve_db(args.db)
     if not db_path.exists():
         raise SystemExit(f"DB not found: {db_path}")
 
+    sql = (
+        "SELECT side, status, model_prob, contract_price, contract_cost, "
+        "pnl, edge, placed_at FROM prediction_bets "
+        "WHERE status IN ('WON','LOST')"
+    )
+    params: list[str] = []
+    if args.since:
+        sql += " AND placed_at >= ?"
+        params.append(args.since)
+    if args.until:
+        sql += " AND placed_at < ?"
+        params.append(args.until)
+    sql += " ORDER BY id"
+
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT side, status, model_prob, contract_price, contract_cost, "
-            "pnl, edge FROM prediction_bets "
-            "WHERE status IN ('WON','LOST') ORDER BY id"
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     except sqlite3.Error as exc:
         raise SystemExit(f"Could not read prediction_bets: {exc}") from exc
     finally:
