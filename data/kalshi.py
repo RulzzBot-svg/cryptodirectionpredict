@@ -126,6 +126,19 @@ class KalshiBook:
         return self.yes_ask_depth if side == "ABOVE" else self.no_ask_depth
 
 
+def _book_price(raw: Any) -> Optional[float]:
+    """Normalize a book price to dollars.
+
+    Kalshi returns cents in the classic shape (``17``) and fixed-point dollar
+    strings in the ``_fp`` shape (``"0.1700"``). Anything at or above 1 must be
+    cents, since a contract can never be worth a dollar or more.
+    """
+    price = _parse_float(raw)
+    if price is None or price <= 0:
+        return None
+    return price / 100.0 if price >= 1.0 else price
+
+
 def _best_bid(levels: Any) -> tuple[Optional[float], float]:
     """Highest bid and its size from one side of a Kalshi book.
 
@@ -140,10 +153,10 @@ def _best_bid(levels: Any) -> tuple[Optional[float], float]:
     for level in levels or []:
         price = size = None
         if isinstance(level, (list, tuple)) and len(level) >= 2:
-            price = _parse_float(level[0])
+            price = _book_price(level[0])
             size = _parse_float(level[1])
         elif isinstance(level, dict):
-            price = _parse_float(
+            price = _book_price(
                 level.get("price", level.get("price_cents", level.get("p")))
             )
             size = _parse_float(
@@ -176,9 +189,18 @@ def fetch_orderbook(
         logger.warning("Kalshi orderbook fetch failed (%s): %s", ticker, exc)
         return None
 
-    book = payload.get("orderbook") or payload or {}
-    yes_bid, yes_bid_size = _best_bid(book.get("yes"))
-    no_bid, no_bid_size = _best_bid(book.get("no"))
+    # Kalshi serves the classic `orderbook` (cents) and the fixed-point
+    # `orderbook_fp` (dollar strings) shapes depending on the market.
+    book = payload.get("orderbook") or payload.get("orderbook_fp") or payload or {}
+
+    def _side(*names: str) -> Any:
+        for name in names:
+            if isinstance(book, dict) and book.get(name):
+                return book[name]
+        return None
+
+    yes_bid, yes_bid_size = _best_bid(_side("yes", "yes_dollars", "yes_fp"))
+    no_bid, no_bid_size = _best_bid(_side("no", "no_dollars", "no_fp"))
     if yes_bid is None and no_bid is None:
         # Never seen in testing; log the shape once so a format change is
         # diagnosable instead of looking like an empty market.
@@ -189,9 +211,9 @@ def fetch_orderbook(
             json.dumps(payload)[:200],
         )
 
-    # Buying YES lifts the best NO bid at its complement (prices are in cents)
-    yes_ask = (100.0 - no_bid) / 100.0 if no_bid is not None else None
-    no_ask = (100.0 - yes_bid) / 100.0 if yes_bid is not None else None
+    # Buying YES lifts the best NO bid at its complement (prices are in dollars)
+    yes_ask = 1.0 - no_bid if no_bid is not None else None
+    no_ask = 1.0 - yes_bid if yes_bid is not None else None
 
     def _sane(price: Optional[float]) -> Optional[float]:
         if price is None or price <= 0.0 or price >= 1.0:
