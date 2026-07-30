@@ -844,7 +844,10 @@ async def run_bot(
                                     ask_now = true_ask
 
                             if not send_order:
-                                live_attempts[window.window_id] = attempts + 1
+                                # Deciding not to order is not an attempt. Only
+                                # submitted orders count, or a few bad ticks
+                                # would lock the bot out of the whole window.
+                                pass
                             elif LIVE_ORDER_MODE == "maker":
                                 # A maker order sits on the BID. Resting at the
                                 # ask would cross, and post_only would reject it.
@@ -855,7 +858,6 @@ async def run_bot(
                                 )
                                 if best_bid is None:
                                     note_skip("no bid to join")
-                                    live_attempts[window.window_id] = attempts + 1
                                     print(
                                         f"[{_utcnow_label()}] LIVE skip — no "
                                         f"{advice.action} bid to join on {ticker}"
@@ -872,7 +874,6 @@ async def run_bot(
                                 rest_price = math.floor(rest_price * 100.0) / 100.0
                                 if rest_price < 0.01:
                                     note_skip("no maker price with edge")
-                                    live_attempts[window.window_id] = attempts + 1
                                     print(
                                         f"[{_utcnow_label()}] LIVE skip — no maker "
                                         f"price leaves {MIN_EDGE*100:.0f}¢ edge "
