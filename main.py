@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -91,6 +92,10 @@ LIVE_DRY_RUN = live_dry_run_requested()
 # A missed IOC order may be retried on later ticks, but only while the edge
 # still qualifies at the *current* ask — never by chasing the old price.
 LIVE_MAX_ATTEMPTS = int(os.getenv("LIVE_MAX_ATTEMPTS", "3"))
+# Bid this far above the displayed ask so a 1¢ tick doesn't cost the trade.
+# A limit order still pays the best available price, so this only costs money
+# on fills that would otherwise have missed entirely.
+LIVE_PRICE_TOLERANCE = float(os.getenv("LIVE_PRICE_TOLERANCE_CENTS", "1")) / 100.0
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -212,6 +217,28 @@ def _print_window_performance(stats: dict[str, Any]) -> None:
         f"All-in ${float(stats['equity']):,.2f}"
     )
     print("-" * 60)
+
+
+def _limit_price_with_tolerance(
+    *,
+    ask: float,
+    model_prob: float,
+    tolerance: float = LIVE_PRICE_TOLERANCE,
+    min_edge: float = MIN_EDGE,
+) -> float:
+    """Highest price worth bidding for this side.
+
+    Willing to pay a little above the displayed ask so a one-cent tick doesn't
+    cost the trade, but never past the point where the edge drops below
+    ``min_edge``. Rounded down to a whole cent to stay on Kalshi's tick grid.
+    """
+    if tolerance <= 0:
+        return ask
+    edge_ceiling = model_prob - min_edge
+    limit = min(ask + tolerance, edge_ceiling)
+    limit = math.floor(limit * 100.0) / 100.0
+    # Never bid below the ask we already qualified on
+    return max(ask, min(limit, 0.98))
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -437,6 +464,8 @@ async def run_bot(
     # Per-window live order state (paper book already guards itself)
     live_attempts: dict[str, int] = {}
     live_filled_windows: set[str] = set()
+    live_fill_count = 0
+    live_miss_count = 0
     warned_stale_file = False
     last_backup_at = datetime.now(timezone.utc).timestamp()
     last_calibration_at = 0.0
@@ -686,24 +715,47 @@ async def run_bot(
                                 f"{held:g} on {ticker}"
                             )
                         else:
+                            ask_now = float(advice.entry_share_price)
+                            model_now = (
+                                advice.prob_above
+                                if advice.action == "ABOVE"
+                                else advice.prob_below
+                            )
+                            bid_price = _limit_price_with_tolerance(
+                                ask=ask_now, model_prob=float(model_now)
+                            )
                             live_plan = live_exec.execute(
                                 live_exec.plan_order(
                                     market_ticker=ticker,
                                     advice_side=advice.action,  # type: ignore[arg-type]
-                                    share_price=float(advice.entry_share_price),
+                                    share_price=bid_price,
                                 )
                             )
                             live_attempts[window.window_id] = attempts + 1
                             note = "ORDER" if live_plan.submitted else "DRY-RUN"
+                            pad = ""
+                            if bid_price > ask_now:
+                                pad = f" (ask {ask_now*100:.0f}¢ +{(bid_price-ask_now)*100:.0f}¢)"
                             print(
                                 f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
                                 f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
                                 f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
-                                f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
+                                f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS}){pad}"
                                 + (f" err={live_plan.error}" if live_plan.error else "")
                             )
                             notifier.live_order_plan(live_plan, note=note)
                             live_filled = bool(live_plan.submitted and live_plan.filled)
+                            if live_plan.submitted:
+                                if live_filled:
+                                    live_fill_count += 1
+                                else:
+                                    live_miss_count += 1
+                                total_orders = live_fill_count + live_miss_count
+                                print(
+                                    f"[{_utcnow_label()}] LIVE fill rate "
+                                    f"{live_fill_count}/{total_orders} "
+                                    f"({live_fill_count / total_orders * 100:.0f}%)"
+                                )
                             if live_filled:
                                 live_filled_windows.add(window.window_id)
                 # The book mirrors whatever actually happened: the paper
@@ -765,6 +817,12 @@ async def run_bot(
                         )
                     except KalshiAuthError as exc:
                         logger.warning("Heartbeat balance check failed: %s", exc)
+                    orders_sent = live_fill_count + live_miss_count
+                    if orders_sent:
+                        kalshi_cash += (
+                            f"Fills {live_fill_count}/{orders_sent} "
+                            f"({live_fill_count / orders_sent * 100:.0f}%) | "
+                        )
                 notifier.info(
                     f"HEARTBEAT alive | BTC ${price:,.2f} | "
                     f"{advice.action} edge {advice.edge*100:+.1f}¢ | "

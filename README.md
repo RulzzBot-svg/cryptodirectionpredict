@@ -162,7 +162,14 @@ cash next to it so any drift is visible. Telegram alerts are prefixed `[LIVE]`.
 **Missed fills.** Live orders are IOC, so they either fill immediately or die.
 A miss is retried on a later tick (up to `LIVE_MAX_ATTEMPTS`, default 3) but
 only if the edge still clears `MIN_EDGE` against the **current** ask — the bot
-never chases the price it originally wanted. Before each live order it checks
+never chases the price it originally wanted.
+
+Orders are placed `LIVE_PRICE_TOLERANCE_CENTS` (default 1¢) above the displayed
+ask so a single tick doesn't cost the trade. Because these are limit orders you
+still pay the **best available** price, so the tolerance only costs anything on
+fills that would otherwise have missed — and the bid is capped so the edge never
+drops below `MIN_EDGE`. Fill rate is printed after each order and included in
+the heartbeat. Before each live order it checks
 Kalshi for an existing position on that market, so a restart mid-window cannot
 double a bet. If that check fails, the order is skipped rather than risked.
 
