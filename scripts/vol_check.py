@@ -85,6 +85,40 @@ def _f(row: dict, key: str) -> Optional[float]:
         return None
 
 
+def robust_sigma(values: list[float]) -> tuple[float, float, float]:
+    """Three views of 'how wide' a return distribution is.
+
+    Standard deviation is dominated by the rare large moves. The median
+    absolute deviation and interquartile range describe the ordinary middle of
+    the distribution instead. For a true normal all three agree; the more they
+    diverge, the more the distribution is peaked-with-fat-tails — and the more
+    misleading standard deviation is for pricing a nearby strike.
+    """
+    n = len(values)
+    sd = statistics.stdev(values) if n > 1 else 0.0
+    med = statistics.median(values)
+    mad = statistics.median([abs(v - med) for v in values])
+    sigma_mad = 1.4826 * mad  # scaled so it equals sd for a normal
+    ordered = sorted(values)
+    q1 = ordered[int(0.25 * (n - 1))]
+    q3 = ordered[int(0.75 * (n - 1))]
+    sigma_iqr = (q3 - q1) / 1.349  # same normalization
+    return sd, sigma_mad, sigma_iqr
+
+
+def excess_kurtosis(values: list[float]) -> Optional[float]:
+    """0 for a normal distribution; large positive means fat tails."""
+    n = len(values)
+    if n < 4:
+        return None
+    mean = statistics.fmean(values)
+    sd = statistics.stdev(values)
+    if sd <= 0:
+        return None
+    m4 = sum((v - mean) ** 4 for v in values) / n
+    return m4 / (sd**4) - 3.0
+
+
 def annualize(sigma_per_sqrt_second: float) -> float:
     return sigma_per_sqrt_second * math.sqrt(365.25 * 24 * 3600)
 
@@ -201,6 +235,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"    annualized         : {annualize(pss)*100:.0f}%")
         if bucket == "kalshi_official":
             realized_pss = pss
+            sd, s_mad, s_iqr = robust_sigma(vals)
+            kurt = excess_kurtosis(vals)
+            print(f"    from std dev       : {sd*100:.3f}%  <- what the model uses")
+            print(f"    from MAD           : {s_mad*100:.3f}%  <- the ordinary middle")
+            print(f"    from IQR           : {s_iqr*100:.3f}%")
+            if kurt is not None:
+                shape = (
+                    "fat tails: std dev overstates the typical move"
+                    if kurt > 1.0
+                    else "roughly normal"
+                )
+                print(f"    excess kurtosis    : {kurt:+.1f}  ({shape})")
     if realized_pss is None and len(realized_returns) >= 10:
         realized_pss = statistics.stdev(realized_returns) / math.sqrt(WINDOW_SECONDS)
 
@@ -222,7 +268,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("-" * 70)
     if model_sigmas and realized_pss:
         ratio = statistics.median(model_sigmas) / realized_pss
-        print(f"  model / realized : {ratio:.2f}x")
+        print(f"  model / realized : {ratio:.2f}x   (realized = Kalshi's index where available)")
         if ratio > 1.15:
             print("  → The model thinks BTC is jumpier than it is. Every")
             print("    probability it publishes sits too close to 50%, which")
