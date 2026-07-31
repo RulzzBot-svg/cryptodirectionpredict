@@ -110,15 +110,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     with path.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
 
-    # Realized: how far price actually travelled from the strike each window
+    # Realized: how far price actually travelled from the strike each window.
+    # Split by source — Kalshi's own settlement value measures the index that
+    # actually decides these contracts, while a Coinbase reading measures spot.
+    # If Kalshi settles on a time-averaged index those two differ, and only the
+    # first one is the volatility the contract cares about.
     realized_returns: list[float] = []
+    by_source: dict[str, list[float]] = {}
     for r in rows:
         if (r.get("event") or "").strip() != "settle":
             continue
         strike = _f(r, "strike")
         settle = _f(r, "settlement_price")
-        if strike and settle and strike > 0 and settle > 0:
-            realized_returns.append(math.log(settle / strike))
+        if not (strike and settle and strike > 0 and settle > 0):
+            continue
+        ret = math.log(settle / strike)
+        realized_returns.append(ret)
+        src = (r.get("settlement_source") or "unknown").strip()
+        bucket = "kalshi_official" if src.startswith("kalshi") else "spot_reading"
+        by_source.setdefault(bucket, []).append(ret)
 
     # Model and market sigma, recovered from published probability and price
     model_sigmas: list[float] = []
@@ -160,16 +170,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Windows settled     : {len(realized_returns)}")
     print(f"  Advice ticks usable : {len(model_sigmas)}")
 
+    realized_pss = None
     if len(realized_returns) >= 10:
         realized_15m = statistics.stdev(realized_returns)
-        realized_pss = realized_15m / math.sqrt(WINDOW_SECONDS)
         print()
-        print("  What BTC actually did")
+        print("  What BTC actually did (all sources pooled)")
         print(f"    15m move (1 sigma) : {realized_15m*100:.3f}% of price")
-        print(f"    annualized         : {annualize(realized_pss)*100:.0f}%")
+        print(
+            f"    annualized         : "
+            f"{annualize(realized_15m / math.sqrt(WINDOW_SECONDS))*100:.0f}%"
+        )
     else:
-        realized_pss = None
         print("\n  Not enough settled windows yet for a realized estimate")
+
+    # Prefer Kalshi's official value: that index is what settles the contract
+    for bucket in ("kalshi_official", "spot_reading"):
+        vals = by_source.get(bucket) or []
+        if len(vals) < 10:
+            continue
+        sd = statistics.stdev(vals)
+        pss = sd / math.sqrt(WINDOW_SECONDS)
+        label = (
+            "Kalshi's own settlement index"
+            if bucket == "kalshi_official"
+            else "our spot reading at close"
+        )
+        print()
+        print(f"  {label}  ({len(vals)} windows)")
+        print(f"    15m move (1 sigma) : {sd*100:.3f}% of price")
+        print(f"    annualized         : {annualize(pss)*100:.0f}%")
+        if bucket == "kalshi_official":
+            realized_pss = pss
+    if realized_pss is None and len(realized_returns) >= 10:
+        realized_pss = statistics.stdev(realized_returns) / math.sqrt(WINDOW_SECONDS)
 
     if model_sigmas:
         med_model = statistics.median(model_sigmas)
