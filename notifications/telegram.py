@@ -130,6 +130,12 @@ class TelegramNotifier:
         )
         if getattr(event, "goal_reached", False):
             msg += "\nVault goal reached — auto-vault pauses."
+        # The vault is bookkeeping only; the cash is still on Kalshi and still
+        # at risk until it's actually withdrawn.
+        msg += (
+            f"\nBookkeeping only — no money left Kalshi. To actually bank it, "
+            f"withdraw ${float(event.amount):,.2f} to your bank."
+        )
         self.send(msg)
 
     def live_order_plan(self, plan: Any, *, note: str = "DRY-RUN") -> None:

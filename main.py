@@ -126,6 +126,8 @@ SETTLE_REQUIRE_OFFICIAL = os.getenv("SETTLE_REQUIRE_OFFICIAL", "true").strip().l
     "on",
 }
 SETTLE_WAIT_SECONDS = float(os.getenv("SETTLE_WAIT_SECONDS", "600"))
+# Alert when the book and the real Kalshi balance disagree by more than this
+BOOK_DRIFT_ALERT = float(os.getenv("BOOK_DRIFT_ALERT", "3"))
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -1106,6 +1108,22 @@ async def run_bot(
                     try:
                         balance = live_exec.client.get_balance().balance_usd
                         extras += f"Kalshi ${balance:,.2f} | "
+                        # Kalshi is the truth. Vaulted cash may or may not still
+                        # be sitting there depending on whether it's actually
+                        # been withdrawn, so accept either reading and only
+                        # complain when neither reconciles.
+                        bank_only = float(stats_hb["usd_balance"]) - balance
+                        with_vault = (
+                            bank_only + float(stats_hb.get("vaulted_usd") or 0.0)
+                        )
+                        drift = min((bank_only, with_vault), key=abs)
+                        if abs(drift) > BOOK_DRIFT_ALERT:
+                            notifier.info(
+                                f"BOOK DRIFT ${drift:+,.2f} — bank "
+                                f"${stats_hb['usd_balance']:,.2f} vs Kalshi "
+                                f"${balance:,.2f}. Kalshi is correct; the book is "
+                                "recording outcomes that don't match."
+                            )
                     except KalshiAuthError as exc:
                         logger.warning("Heartbeat balance check failed: %s", exc)
                     orders_sent = live_fill_count + live_miss_count
