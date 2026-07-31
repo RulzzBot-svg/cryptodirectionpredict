@@ -137,8 +137,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         if m is None:
             continue
         model_sigmas.append(m)
-        if ask is not None:
-            k = implied_sigma(spot, strike, tau, ask)
+        # Invert the mid, not the ask. The ask carries the spread, which biases
+        # the implied sigma low and makes the market look far calmer than it is.
+        # Kalshi quotes NO from the other side of the book, so the YES bid is
+        # 1 - no_ask.
+        no_ask = _f(r, "no_ask")
+        mid = None
+        if ask is not None and no_ask is not None:
+            mid = (ask + (1.0 - no_ask)) / 2.0
+        elif ask is not None:
+            mid = ask
+        if mid is not None:
+            k = implied_sigma(spot, strike, tau, mid)
             if k is not None:
                 market_sigmas.append(k)
                 pairs.append((m, k))
