@@ -134,6 +134,25 @@ class PredictionBook:
         with self.session_factory() as session:
             return float(self._get_bankroll(session).usd_balance)
 
+    def set_bank(self, amount: float, *, reason: str = "reconciled") -> float:
+        """Force the cash balance to a known figure, keeping all bet history.
+
+        Used after depositing or withdrawing on the exchange, where the book has
+        no way to learn that cash moved. Returns the previous balance.
+        """
+        target = float(amount)
+        with self.session_factory() as session:
+            row = self._get_bankroll(session)
+            previous = float(row.usd_balance)
+            row.usd_balance = target
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        self._log(
+            f"Bank {reason} | ${previous:,.2f} → ${target:,.2f} "
+            f"({target - previous:+,.2f}) | bet history kept"
+        )
+        return previous
+
     def get_vaulted(self) -> float:
         with self.session_factory() as session:
             return float(getattr(self._get_bankroll(session), "vaulted_usd", 0.0) or 0.0)

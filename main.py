@@ -128,6 +128,14 @@ SETTLE_REQUIRE_OFFICIAL = os.getenv("SETTLE_REQUIRE_OFFICIAL", "true").strip().l
 SETTLE_WAIT_SECONDS = float(os.getenv("SETTLE_WAIT_SECONDS", "600"))
 # Alert when the book and the real Kalshi balance disagree by more than this
 BOOK_DRIFT_ALERT = float(os.getenv("BOOK_DRIFT_ALERT", "3"))
+# One-shot: set the book's cash to the real Kalshi balance, keeping bet history.
+# For use after depositing or withdrawing, which the book can't observe.
+RECONCILE_BANK = os.getenv("RECONCILE_BANK", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -448,6 +456,12 @@ async def run_bot(
                     f"[{_utcnow_label()}] Kalshi auth OK | "
                     f"cash ${bal.balance_usd:,.2f} | base {auth_client.base_url}"
                 )
+                if RECONCILE_BANK:
+                    book.set_bank(bal.balance_usd, reason="reconciled to Kalshi")
+                    print(
+                        f"[{_utcnow_label()}] Set RECONCILE_BANK back to false so "
+                        "the next restart doesn't overwrite a live balance"
+                    )
             except KalshiAuthError as exc:
                 print(f"[{_utcnow_label()}] Kalshi auth FAILED: {exc}")
                 if LIVE_TRADING:
