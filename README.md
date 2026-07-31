@@ -270,7 +270,17 @@ Same working bank forever while profits get “put aside”:
 - Repeats until **$300** is put aside, then auto-vault pauses
 
 Telegram gets a `PAPER VAULT` ping on each withdraw. All-in P/L still counts
-vaulted cash. Live Kalshi later: same habit, real ACH withdraw.
+vaulted cash.
+
+**The vault moves no money.** It is bookkeeping: it marks cash as set aside and
+shrinks the bank the bot trades against, so a good run doesn't quietly inflate
+how rich the bot thinks it is. On live, every vaulted dollar is still sitting in
+Kalshi and still at risk until you withdraw it to your bank yourself. The alert
+says so each time.
+
+The trigger scales with the configured working bank, which is
+`PAPER_INITIAL_BALANCE` — seed the book at $127 and the first vault fires at
+$182, not $155.
 
 ### Results breakdown (hour / side / price)
 
