@@ -282,6 +282,18 @@ The trigger scales with the configured working bank, which is
 `PAPER_INITIAL_BALANCE` — seed the book at $127 and the first vault fires at
 $182, not $155.
 
+### After depositing or withdrawing
+
+The book can't see cash moving on the exchange, so withdrawing leaves it
+believing it has money that isn't there. Set `RECONCILE_BANK=true` for one
+restart: it sets the book's cash to the real Kalshi balance and **keeps all bet
+history**, so calibration data survives. Set it back to `false` afterwards, or
+the next restart will overwrite a live balance.
+
+Leave enough on the exchange for the bot to keep trading — at `$5` face it risks
+roughly $1–4 per window, so a working balance near $100 is comfortable and
+anything under ~$20 will start getting orders rejected.
+
 ### Results breakdown (hour / side / price)
 
 Read-only report — safe to run while the bot is live:
