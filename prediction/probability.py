@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,17 +36,40 @@ class ProbabilityEstimate:
         return self.prob_below * 100.0
 
 
+def _scale_from_returns(log_returns: pd.Series, estimator: str) -> float:
+    """Width of a return distribution, by one of two definitions.
+
+    ``std`` is the textbook choice but is dominated by rare large moves. Whether
+    price crosses a strike a short distance away is decided by ordinary windows,
+    not violent ones, so ``mad`` measures the middle of the distribution instead
+    (scaled to match std for a true normal). For BTC's peaked, jump-prone
+    15-minute returns the two differ by well over 50%, and using std makes every
+    probability sit too close to a coin flip.
+    """
+    if estimator == "std":
+        return float(log_returns.std(ddof=1))
+    median = float(log_returns.median())
+    mad = float((log_returns - median).abs().median())
+    return 1.4826 * mad
+
+
 def realized_vol_per_sqrt_second(
     candles: pd.DataFrame,
     *,
     min_bars: int = 20,
     fallback_annual_vol: float = 0.60,
+    estimator: Optional[str] = None,
 ) -> float:
     """
     Estimate σ such that variance over ``t`` seconds ≈ (σ_per_sqrt_second ** 2) * t.
 
     Uses log-returns of candle closes and scales by median bar duration.
     """
+    estimator = (
+        estimator if estimator is not None else os.getenv("VOL_ESTIMATOR", "std")
+    ).strip().lower()
+    if estimator not in {"std", "mad"}:
+        estimator = "std"
     seconds_per_year = 365.25 * 24 * 3600
     fallback = fallback_annual_vol / math.sqrt(seconds_per_year)
 
@@ -69,7 +93,7 @@ def realized_vol_per_sqrt_second(
             if median > 0:
                 bar_seconds = median
 
-    sigma_bar = float(log_returns.tail(100).std(ddof=1))
+    sigma_bar = _scale_from_returns(log_returns.tail(100), estimator)
     if not math.isfinite(sigma_bar) or sigma_bar <= 0:
         return fallback
 
