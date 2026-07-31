@@ -116,6 +116,16 @@ SPOT_STREAM = os.getenv("SPOT_STREAM", "true").strip().lower() in {
     "on",
 }
 SPOT_MAX_AGE_SECONDS = float(os.getenv("SPOT_MAX_AGE_SECONDS", "3"))
+# Kalshi finalizes a market a little after the window closes. Settling from our
+# own spot reading instead disagrees with Kalshi whenever price is near the
+# strike — which is nearly always — so wait for the official result.
+SETTLE_REQUIRE_OFFICIAL = os.getenv("SETTLE_REQUIRE_OFFICIAL", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SETTLE_WAIT_SECONDS = float(os.getenv("SETTLE_WAIT_SECONDS", "600"))
 
 STRIKE_FILE = Path(os.getenv("MANUAL_STRIKE_FILE", "manual_strike.txt"))
 MARKET_CENTS_FILE = Path(os.getenv("MARKET_CENTS_FILE", "market_cents.txt"))
@@ -509,6 +519,9 @@ async def run_bot(
     def note_skip(reason: str) -> None:
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
 
+    # Windows whose outcome Kalshi hasn't published yet: (window, ticker, closed_at)
+    pending_settlements: list[tuple[Any, str, float]] = []
+
     # Advice/window captured when the order was placed — the model view may have
     # moved on by the time it fills, but the bet belongs to the original call.
     resting_advice: Any = None
@@ -618,59 +631,16 @@ async def run_bot(
             lock_price = kalshi_strike or strike_hint
             window, expired = windows.update(price, strike_price=lock_price)
             if expired is not None:
-                settle_price = float(expired.settlement_price or price)
-                outcome_side = expired.outcome
-                settle_source = "coinbase_spot"
-                if use_kalshi:
-                    side, exp_val, src = await asyncio.to_thread(
-                        fetch_window_settlement,
-                        series_ticker=KALSHI_SERIES,
-                        window_end=expired.end,
-                        market_ticker=kalshi_market_ticker or None,
-                    )
-                    if side in ("ABOVE", "BELOW"):
-                        outcome_side = side
-                        settle_source = src
-                        if exp_val is not None and exp_val > 0:
-                            settle_price = float(exp_val)
-                        expired.outcome = side
-                        expired.settlement_price = settle_price
+                # Don't settle yet — Kalshi hasn't finalized the market. Queue it
+                # and resolve once the official outcome is available.
+                pending_settlements.append(
+                    (expired, kalshi_market_ticker, datetime.now(timezone.utc).timestamp())
+                )
                 print()
                 print(
-                    f"[{_utcnow_label()}] Window {expired.window_id} settled "
-                    f"{outcome_side} @ ${settle_price:,.2f} "
-                    f"(strike ${float(expired.strike):,.2f}) via {settle_source}"
+                    f"[{_utcnow_label()}] Window {expired.window_id} closed "
+                    f"(strike ${float(expired.strike):,.2f}) — awaiting Kalshi result"
                 )
-                settled_bet = book.settle_window(
-                    expired,
-                    settle_price,
-                    outcome_side=outcome_side if outcome_side in ("ABOVE", "BELOW") else None,
-                )
-                if settled_bet is not None:
-                    notifier.bet_settled(settled_bet)
-                vault_event = book.maybe_vault_profits()
-                if vault_event is not None:
-                    notifier.vault_withdrawal(vault_event)
-                stats = book.get_performance_stats()
-                _print_window_performance(stats)
-                skip_summary = ", ".join(
-                    f"{count}× {reason}"
-                    for reason, count in sorted(
-                        skip_counts.items(), key=lambda kv: -kv[1]
-                    )
-                )
-                notifier.window_stats(stats, skips=skip_summary)
-                skip_counts.clear()
-                calibration.log_settle(
-                    window_id=expired.window_id,
-                    symbol=symbol,
-                    strike=float(expired.strike) if expired.strike is not None else None,
-                    outcome=outcome_side,
-                    settlement_price=settle_price,
-                    settlement_source=settle_source,
-                )
-                backup_now(database_url=settings.database_url)
-                last_backup_at = datetime.now(timezone.utc).timestamp()
                 # CLI manual strike applies to one window unless re-passed
                 if initial_strike is None:
                     pending_manual_strike = None
@@ -754,6 +724,86 @@ async def run_bot(
                 )
                 last_calibration_at = now_ts
                 last_cal_window = window.window_id
+
+            # Resolve any closed window whose official outcome has landed.
+            if pending_settlements:
+                still_pending: list[tuple[Any, str, float]] = []
+                for closed, closed_ticker, closed_at in pending_settlements:
+                    outcome_side: Optional[str] = None
+                    settle_price: Optional[float] = None
+                    settle_source = "kalshi_official"
+                    if use_kalshi:
+                        side, exp_val, src = await asyncio.to_thread(
+                            fetch_window_settlement,
+                            series_ticker=KALSHI_SERIES,
+                            window_end=closed.end,
+                            market_ticker=closed_ticker or None,
+                        )
+                        if side in ("ABOVE", "BELOW"):
+                            outcome_side = side
+                            settle_source = src
+                            if exp_val is not None and exp_val > 0:
+                                settle_price = float(exp_val)
+
+                    waited = datetime.now(timezone.utc).timestamp() - closed_at
+                    if outcome_side is None:
+                        if SETTLE_REQUIRE_OFFICIAL and waited < SETTLE_WAIT_SECONDS:
+                            still_pending.append((closed, closed_ticker, closed_at))
+                            continue
+                        # Out of patience. Our own spot disagrees with Kalshi near
+                        # the strike, so say so loudly rather than book it quietly.
+                        outcome_side = None
+                        settle_price = float(closed.settlement_price or price)
+                        settle_source = "coinbase_spot_fallback"
+                        print(
+                            f"[{_utcnow_label()}] WARNING: no Kalshi result for "
+                            f"{closed.window_id} after {waited:.0f}s — settling from "
+                            "spot, which may disagree with Kalshi"
+                        )
+
+                    if settle_price is None:
+                        settle_price = float(closed.settlement_price or price)
+                    closed.outcome = outcome_side
+                    closed.settlement_price = settle_price
+                    print(
+                        f"[{_utcnow_label()}] Window {closed.window_id} settled "
+                        f"{outcome_side or '(from spot)'} @ ${settle_price:,.2f} "
+                        f"(strike ${float(closed.strike):,.2f}) via {settle_source} "
+                        f"after {waited:.0f}s"
+                    )
+                    settled_bet = book.settle_window(
+                        closed,
+                        settle_price,
+                        outcome_side=outcome_side
+                        if outcome_side in ("ABOVE", "BELOW")
+                        else None,
+                    )
+                    if settled_bet is not None:
+                        notifier.bet_settled(settled_bet)
+                    vault_event = book.maybe_vault_profits()
+                    if vault_event is not None:
+                        notifier.vault_withdrawal(vault_event)
+                    stats = book.get_performance_stats()
+                    _print_window_performance(stats)
+                    skip_summary = ", ".join(
+                        f"{count}× {reason}"
+                        for reason, count in sorted(
+                            skip_counts.items(), key=lambda kv: -kv[1]
+                        )
+                    )
+                    notifier.window_stats(stats, skips=skip_summary)
+                    skip_counts.clear()
+                    calibration.log_settle(
+                        window_id=closed.window_id,
+                        symbol=symbol,
+                        strike=float(closed.strike) if closed.strike is not None else None,
+                        outcome=outcome_side,
+                        settlement_price=settle_price,
+                        settlement_source=settle_source,
+                    )
+                    backup_now(database_url=settings.database_url)
+                    last_backup_at = datetime.now(timezone.utc).timestamp()
+                pending_settlements = still_pending
 
             # A resting order may have been hit since the last tick.
             if resting is not None and live_exec is not None:
