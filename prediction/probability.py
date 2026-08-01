@@ -126,6 +126,41 @@ def estimate_prob_above(
     tau = max(float(seconds_remaining), 0.0)
     distance_pct = (spot - strike) / strike * 100.0
 
+    # BTC's 15m returns are far from normal (excess kurtosis ~+16), so no single
+    # sigma describes both the peak and the jumps. When asked, and when there's
+    # enough history, use the shape of past returns directly instead.
+    model = os.getenv("PROB_MODEL", "lognormal").strip().lower()
+    if model == "empirical" and candles is not None and sigma_per_sqrt_second is None:
+        from prediction.empirical import fit_returns, prob_above_empirical
+
+        fit = fit_returns(candles)
+        if fit is not None:
+            p_above = prob_above_empirical(
+                spot=spot, strike=strike, seconds_remaining=tau, fit=fit
+            )
+            p_below = 1.0 - p_above
+            seconds_per_year = 365.25 * 24 * 3600
+            # Report the distribution's own robust width so the status line and
+            # diagnostics stay comparable across models.
+            sigma_report = fit.scale_15m / math.sqrt(15 * 60) if fit.scale_15m else sigma
+            return ProbabilityEstimate(
+                spot=float(spot),
+                strike=float(strike),
+                seconds_remaining=tau,
+                sigma_per_sqrt_second=sigma_report,
+                annualized_vol=sigma_report * math.sqrt(seconds_per_year),
+                prob_above=p_above,
+                prob_below=p_below,
+                distance_pct=distance_pct,
+                moneyness=(
+                    "ITM_ABOVE"
+                    if spot > strike * 1.0005
+                    else "ITM_BELOW"
+                    if spot < strike * 0.9995
+                    else "ATM"
+                ),
+            )
+
     if tau <= 1e-9:
         if spot > strike:
             p_above = 1.0

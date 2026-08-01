@@ -62,6 +62,17 @@ logger = logging.getLogger("main")
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
+# The empirical probability model needs a few hundred bars to describe the
+# shape of the return distribution; the lognormal only needs enough for a
+# volatility estimate.
+OHLCV_LIMIT = int(
+    os.getenv(
+        "OHLCV_LIMIT",
+        # Coinbase caps 15m history at 300 bars (~3 days), which is enough for
+        # the empirical fit's 200-sample minimum.
+        "300" if os.getenv("PROB_MODEL", "lognormal").strip().lower() == "empirical" else "100",
+    )
+)
 CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))  # legacy unused
 STAKE_NOTIONAL = float(os.getenv("STAKE_NOTIONAL", "5"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -364,6 +375,10 @@ async def run_bot(
     print(f"  Candle TF       : {TIMEFRAME}")
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
     print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢")
+    print(
+        f"  Probability     : {os.getenv('PROB_MODEL', 'lognormal')} "
+        f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars)"
+    )
     print(f"  Strike source   : {'kalshi' if use_kalshi else 'manual/auto'}")
     if market_locked:
         print(
@@ -601,6 +616,7 @@ async def run_bot(
                     timeframe=TIMEFRAME,
                     provider=provider,
                     exchange=exchange,
+                    ohlcv_limit=OHLCV_LIMIT,
                 )
                 consecutive_errors = 0
             except asyncio.CancelledError:
