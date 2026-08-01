@@ -236,6 +236,30 @@ On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 
 > **Note:** Cursor Cloud / some VPS regions get HTTP 451 from Binance. Prefer Coinbase (`BTC/USD`) or Kraken there.
 
+## Choosing a probability model
+
+Live results forced this question. BTC's 15-minute returns have excess kurtosis
+around **+16** — a sharp peak with rare violent jumps — so no single sigma
+describes them. Measured over 645 windows:
+
+| Measure | 15m move (1σ) |
+|---|---|
+| Standard deviation | 0.150% |
+| MAD / IQR | 0.089% / 0.088% |
+| What Kalshi's prices imply | 0.089% |
+
+Fitting sigma to the standard deviation overstates the ordinary window, which
+inflates the probability of reaching a nearby strike — and that is the side an
+edge-seeking bot buys. Running that way, the model was **15.6 points
+overconfident** on the bets it selected, claiming 11.7¢ of edge and realizing
+−3.9¢.
+
+`VOL_ESTIMATOR=mad` matches the market's implied width but has thin tails, which
+understates jumps. `PROB_MODEL=empirical` uses the observed distribution instead
+and keeps both the peak and the tails. It is **unverified** — it disagrees with
+market pricing in the same direction the too-wide estimator did — so prove it
+with a paper run and `calibration_report.py` before funding it.
+
 ## Probability model
 
 For spot `S`, strike `K`, seconds remaining `τ`, and σ estimated from recent
