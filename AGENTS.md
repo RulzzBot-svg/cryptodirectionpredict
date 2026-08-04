@@ -26,15 +26,6 @@ print('prediction package ok')
 PY
 ```
 
-## Weather Kalshi bot (`weather/`)
+## Weather Kalshi bot
 
-Self-contained paper bot for Kalshi daily high-temp markets (Open-Meteo
-ensemble → bucket probs → edge vs Kalshi). Does not use the BTC `main.py`.
-
-```bash
-cd weather
-# deps: requests, python-dotenv (also fine via repo .venv)
-../.venv/bin/pip install -r requirements.txt
-cp .env.example .env
-../.venv/bin/python main.py --once
-```
+Moved to https://github.com/RulzzBot-svg/weatherpredict (separate repo).
