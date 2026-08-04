@@ -46,6 +46,11 @@ class PredictionAdvisor:
     Edge is measured against the price you would pay:
       ABOVE edge = P(above) - yes_ask
       BELOW edge = P(below) - no_ask
+
+    Optional bounds kill the two buckets that keep showing up as losers:
+      - cheap longshots (low ask / low model prob)
+      - overconfident favorites (high ask / high model prob)
+    Set any bound to 0 to disable it.
     """
 
     def __init__(
@@ -56,12 +61,20 @@ class PredictionAdvisor:
         max_seconds_to_bet: Optional[float] = None,
         min_seconds_to_bet: float = 20.0,
         require_tradable_quotes: bool = True,
+        min_entry_price: float = 0.0,
+        max_entry_price: float = 0.0,
+        min_model_prob: float = 0.0,
+        max_model_prob: float = 0.0,
     ) -> None:
         self.min_edge = min_edge
         self.market_prob_above = market_prob_above
         self.max_seconds_to_bet = max_seconds_to_bet
         self.min_seconds_to_bet = min_seconds_to_bet
         self.require_tradable_quotes = require_tradable_quotes
+        self.min_entry_price = float(min_entry_price or 0.0)
+        self.max_entry_price = float(max_entry_price or 0.0)
+        self.min_model_prob = float(min_model_prob or 0.0)
+        self.max_model_prob = float(max_model_prob or 0.0)
 
     @staticmethod
     def _valid_ask(value: Optional[float]) -> Optional[float]:
@@ -72,6 +85,52 @@ class PredictionAdvisor:
         if price < 0.02 or price > 0.98:
             return None
         return price
+
+    def _filter_skip_reason(self, *, model_prob: float, entry: float) -> Optional[str]:
+        """Return a human skip reason when a candidate bet is out of bounds."""
+        if self.min_entry_price > 0 and entry < self.min_entry_price:
+            return (
+                f"ask {entry * 100:.1f}¢ below min "
+                f"{self.min_entry_price * 100:.0f}¢"
+            )
+        if self.max_entry_price > 0 and entry > self.max_entry_price:
+            return (
+                f"ask {entry * 100:.1f}¢ above max "
+                f"{self.max_entry_price * 100:.0f}¢"
+            )
+        if self.min_model_prob > 0 and model_prob < self.min_model_prob:
+            return (
+                f"model {model_prob * 100:.1f}% below min "
+                f"{self.min_model_prob * 100:.0f}%"
+            )
+        if self.max_model_prob > 0 and model_prob > self.max_model_prob:
+            return (
+                f"model {model_prob * 100:.1f}% above max "
+                f"{self.max_model_prob * 100:.0f}%"
+            )
+        return None
+
+    def _skip(
+        self,
+        estimate: ProbabilityEstimate,
+        *,
+        edge: float,
+        reason: str,
+        yes: Optional[float],
+        no: Optional[float],
+    ) -> Advice:
+        return Advice(
+            action="SKIP",
+            prob_above=estimate.prob_above,
+            prob_below=estimate.prob_below,
+            edge=edge,
+            fair_yes_cents=estimate.prob_above * 100.0,
+            fair_no_cents=estimate.prob_below * 100.0,
+            reason=reason,
+            estimate=estimate,
+            yes_ask=yes,
+            no_ask=no,
+        )
 
     def advise(
         self,
@@ -116,96 +175,90 @@ class PredictionAdvisor:
 
         remaining = estimate.seconds_remaining
         if remaining < self.min_seconds_to_bet:
-            return Advice(
-                action="SKIP",
-                prob_above=estimate.prob_above,
-                prob_below=estimate.prob_below,
+            return self._skip(
+                estimate,
                 edge=0.0,
-                fair_yes_cents=estimate.prob_above * 100.0,
-                fair_no_cents=estimate.prob_below * 100.0,
                 reason=f"too close to expiry ({remaining:.0f}s left)",
-                estimate=estimate,
-                yes_ask=yes,
-                no_ask=no,
+                yes=yes,
+                no=no,
             )
         if self.max_seconds_to_bet is not None and remaining > self.max_seconds_to_bet:
-            return Advice(
-                action="SKIP",
-                prob_above=estimate.prob_above,
-                prob_below=estimate.prob_below,
+            return self._skip(
+                estimate,
                 edge=0.0,
-                fair_yes_cents=estimate.prob_above * 100.0,
-                fair_no_cents=estimate.prob_below * 100.0,
                 reason="waiting for more of the window to elapse",
-                estimate=estimate,
-                yes_ask=yes,
-                no_ask=no,
+                yes=yes,
+                no=no,
             )
 
         if self.require_tradable_quotes and (yes is None or no is None):
-            return Advice(
-                action="SKIP",
-                prob_above=estimate.prob_above,
-                prob_below=estimate.prob_below,
+            return self._skip(
+                estimate,
                 edge=0.0,
-                fair_yes_cents=estimate.prob_above * 100.0,
-                fair_no_cents=estimate.prob_below * 100.0,
                 reason="no tradable YES/NO ask yet (skipping empty/0¢ book)",
-                estimate=estimate,
-                yes_ask=yes,
-                no_ask=no,
+                yes=yes,
+                no=no,
             )
 
         assert yes is not None and no is not None
         edge_above = estimate.prob_above - yes
         edge_below = estimate.prob_below - no
 
+        action: Side = "SKIP"
+        edge = 0.0
+        model_prob = 0.0
+        entry = 0.0
+        reason = ""
+
         if edge_above >= self.min_edge and edge_above >= edge_below:
-            return Advice(
-                action="ABOVE",
-                prob_above=estimate.prob_above,
-                prob_below=estimate.prob_below,
-                edge=edge_above,
-                fair_yes_cents=estimate.prob_above * 100.0,
-                fair_no_cents=estimate.prob_below * 100.0,
+            action = "ABOVE"
+            edge = edge_above
+            model_prob = estimate.prob_above
+            entry = yes
+            reason = (
+                f"model {estimate.prob_above_pct:.1f}% ABOVE vs YES ask "
+                f"{yes * 100:.1f}¢ (edge {edge_above * 100:.1f}¢)"
+            )
+        elif edge_below >= self.min_edge:
+            action = "BELOW"
+            edge = edge_below
+            model_prob = estimate.prob_below
+            entry = no
+            reason = (
+                f"model {estimate.prob_below_pct:.1f}% BELOW vs NO ask "
+                f"{no * 100:.1f}¢ (edge {edge_below * 100:.1f}¢)"
+            )
+        else:
+            best_edge = max(edge_above, edge_below)
+            return self._skip(
+                estimate,
+                edge=best_edge,
                 reason=(
-                    f"model {estimate.prob_above_pct:.1f}% ABOVE vs YES ask "
-                    f"{yes * 100:.1f}¢ (edge {edge_above * 100:.1f}¢)"
+                    f"no edge (best {best_edge * 100:+.1f}¢, need "
+                    f"{self.min_edge * 100:.0f}¢)"
                 ),
-                estimate=estimate,
-                yes_ask=yes,
-                no_ask=no,
+                yes=yes,
+                no=no,
             )
 
-        if edge_below >= self.min_edge:
-            return Advice(
-                action="BELOW",
-                prob_above=estimate.prob_above,
-                prob_below=estimate.prob_below,
-                edge=edge_below,
-                fair_yes_cents=estimate.prob_above * 100.0,
-                fair_no_cents=estimate.prob_below * 100.0,
-                reason=(
-                    f"model {estimate.prob_below_pct:.1f}% BELOW vs NO ask "
-                    f"{no * 100:.1f}¢ (edge {edge_below * 100:.1f}¢)"
-                ),
-                estimate=estimate,
-                yes_ask=yes,
-                no_ask=no,
+        blocked = self._filter_skip_reason(model_prob=model_prob, entry=entry)
+        if blocked is not None:
+            return self._skip(
+                estimate,
+                edge=edge,
+                reason=f"skip {action}: {blocked}",
+                yes=yes,
+                no=no,
             )
 
-        best_edge = max(edge_above, edge_below)
         return Advice(
-            action="SKIP",
+            action=action,
             prob_above=estimate.prob_above,
             prob_below=estimate.prob_below,
-            edge=best_edge,
+            edge=edge,
             fair_yes_cents=estimate.prob_above * 100.0,
             fair_no_cents=estimate.prob_below * 100.0,
-            reason=(
-                f"no edge (best {best_edge * 100:+.1f}¢, need "
-                f"{self.min_edge * 100:.0f}¢)"
-            ),
+            reason=reason,
             estimate=estimate,
             yes_ask=yes,
             no_ask=no,

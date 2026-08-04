@@ -216,6 +216,10 @@ On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 | `DATA_PROVIDER` | `coinbase` | `coinbase` / `binance` |
 | `PAPER_INITIAL_BALANCE` | `100` | Starting paper bankroll ($) |
 | `MIN_EDGE` | `0.08` | Minimum edge vs ask before betting (8¢) |
+| `MIN_ENTRY_PRICE` | `0` (off) | Skip if share ask is below this (e.g. `0.45`) |
+| `MAX_ENTRY_PRICE` | `0` (off) | Skip if share ask is above this (e.g. `0.74`) |
+| `MIN_MODEL_PROB` | `0` (off) | Skip if model prob on the bet side is below this |
+| `MAX_MODEL_PROB` | `0` (off) | Skip if model prob on the bet side is above this |
 | `MARKET_PROB_ABOVE` | `0.50` | Fallback YES ask if Kalshi quotes missing |
 | `STAKE_NOTIONAL` | `5` | Face value per bet (5 contracts ⇒ pay `5 × share_price`) |
 | `VAULT_ENABLED` | `true` | Auto paper-withdraw profits above working bank |
@@ -259,6 +263,11 @@ understates jumps. `PROB_MODEL=empirical` uses the observed distribution instead
 and keeps both the peak and the tails. It is **unverified** — it disagrees with
 market pricing in the same direction the too-wide estimator did — so prove it
 with a paper run and `calibration_report.py` before funding it.
+
+MAD paper/live also showed a clean split by ticket price: **&lt;45¢ longshots and
+&gt;74¢ / &gt;85% favorites lost**, while **45–74¢** carried the book. Use the entry /
+model bounds above (e.g. `MIN_ENTRY_PRICE=0.45`, `MAX_ENTRY_PRICE=0.74`,
+`MIN_MODEL_PROB=0.45`, `MAX_MODEL_PROB=0.85`) so those buckets cannot fire.
 
 ## Probability model
 

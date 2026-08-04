@@ -62,6 +62,13 @@ logger = logging.getLogger("main")
 LOOP_INTERVAL_SECONDS = float(os.getenv("LOOP_INTERVAL_SECONDS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
+# Kill the buckets that keep losing. 0 disables each bound.
+# Paper/live MAD: cheap longshots (<45¢ / <45% model) and overconfident
+# favorites (>74¢ / >85% model) were the P/L drains.
+MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0"))
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0"))
+MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0"))
+MAX_MODEL_PROB = float(os.getenv("MAX_MODEL_PROB", "0"))
 # The empirical probability model needs a few hundred bars to describe the
 # shape of the return distribution; the lognormal only needs enough for a
 # volatility estimate.
@@ -375,6 +382,20 @@ async def run_bot(
     print(f"  Candle TF       : {TIMEFRAME}")
     print(f"  Loop interval   : {LOOP_INTERVAL_SECONDS:.0f}s")
     print(f"  Min edge        : {MIN_EDGE * 100:.0f}¢")
+    def _bound_label(lo: float, hi: float, *, unit: str) -> str:
+        parts: list[str] = []
+        if lo > 0:
+            parts.append(f"≥{lo * 100:.0f}{unit}")
+        if hi > 0:
+            parts.append(f"≤{hi * 100:.0f}{unit}")
+        return " / ".join(parts) if parts else "off"
+
+    print(
+        f"  Entry filter    : {_bound_label(MIN_ENTRY_PRICE, MAX_ENTRY_PRICE, unit='¢')}"
+    )
+    print(
+        f"  Model filter    : {_bound_label(MIN_MODEL_PROB, MAX_MODEL_PROB, unit='%')}"
+    )
     print(
         f"  Probability     : {os.getenv('PROB_MODEL', 'lognormal')} "
         f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars)"
@@ -500,6 +521,10 @@ async def run_bot(
         min_edge=MIN_EDGE,
         market_prob_above=market_prob_above,
         min_seconds_to_bet=MIN_SECONDS_TO_BET,
+        min_entry_price=MIN_ENTRY_PRICE,
+        max_entry_price=MAX_ENTRY_PRICE,
+        min_model_prob=MIN_MODEL_PROB,
+        max_model_prob=MAX_MODEL_PROB,
     )
     backup_now(database_url=settings.database_url)
     if notifier.active:
