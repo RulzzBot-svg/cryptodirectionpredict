@@ -190,6 +190,12 @@ book, not the softer market snapshot. That stops the old loop where paper/live
 saw an 8¢ edge, then skipped at submit (`edge gone on real book`) and barely
 filled.
 
+**`MIN_EDGE` is net of fees.** The gate subtracts estimated Kalshi taker/maker
+fees before comparing to `MIN_EDGE`. Paper books those fees too (`PAPER_FEE_MODE`,
+default `taker`), so paper stops looking free. Live never settles from Coinbase
+spot while `LIVE_TRADING` is on. Resting orders are polled for fills before
+cancel at window close.
+
 **Taker vs maker (`LIVE_ORDER_MODE`).** The default `taker` mode crosses the
 spread with an IOC order: it fills instantly or not at all, and pays the full
 `0.07 × C × P × (1−P)` fee. Setting `maker` instead rests a **post-only** limit

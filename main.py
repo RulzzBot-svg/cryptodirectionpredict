@@ -50,6 +50,7 @@ from data.kalshi import (
 )
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
 from data.price_tape import PriceTape
+from config.kalshi_fees import net_edge
 from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
 from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
@@ -127,6 +128,18 @@ LIVE_PRICE_TOLERANCE = float(os.getenv("LIVE_PRICE_TOLERANCE_CENTS", "1")) / 100
 #          adverse selection. Short expiry keeps the quote from going stale.
 LIVE_ORDER_MODE = os.getenv("LIVE_ORDER_MODE", "taker").strip().lower()
 LIVE_REST_SECONDS = float(os.getenv("LIVE_REST_SECONDS", "45"))
+# When true, maker may rest either leg if bid-edge clears. Default false:
+# only rest the advisor's ask-edge side (less adverse-selection volume).
+MAKER_ANY_SIDE = os.getenv("MAKER_ANY_SIDE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Fee mode for edge gates + paper fills: taker | maker | none
+# Live maker/taker paths always fee-adjust using their true mode; this mainly
+# controls paper + advisor when deciding before an order type is chosen.
+PAPER_FEE_MODE = os.getenv("PAPER_FEE_MODE", "taker").strip().lower()
 # Stream spot instead of reading it over REST once a loop. Any edge against
 # Kalshi depends on our price being fresher than theirs, not older.
 SPOT_STREAM = os.getenv("SPOT_STREAM", "true").strip().lower() in {
@@ -224,21 +237,23 @@ def _maker_rest_candidate(
     model_prob: float,
     book: KalshiBook,
 ) -> Optional[tuple[float, float]]:
-    """Return (rest_price, edge) when a maker quote clears edge + bounds.
+    """Return (rest_price, net_edge) when a maker quote clears edge + bounds.
 
-    Maker edge is versus the resting bid price, not the ask. Requiring ask
-    edge first was killing live volume: the book ask is often stale/wide
-    while joining the bid still leaves a real edge.
+    Maker edge is versus the resting bid price after maker fees, not the ask.
     """
     best_bid = book.bid_for(side)
     ask = book.ask_for(side)
     if best_bid is None or ask is None:
         return None
+    # Cap rest so gross edge could still clear MIN_EDGE before fee drag.
     rest = min(best_bid + 0.01, ask - 0.01, model_prob - MIN_EDGE)
     rest = _cent_floor(rest)
     # Never rest below the configured floor (the 43¢ maker leak).
     if MIN_ENTRY_PRICE > 0 and rest < MIN_ENTRY_PRICE:
-        if MIN_ENTRY_PRICE < ask - 1e-9 and model_prob - MIN_ENTRY_PRICE >= MIN_EDGE:
+        floor_net = net_edge(
+            model_prob, MIN_ENTRY_PRICE, STAKE_NOTIONAL, maker=True
+        )
+        if MIN_ENTRY_PRICE < ask - 1e-9 and floor_net >= MIN_EDGE:
             rest = _cent_floor(MIN_ENTRY_PRICE)
         else:
             return None
@@ -246,10 +261,19 @@ def _maker_rest_candidate(
         return None
     if _bound_skip_reason(entry=rest, model_prob=model_prob) is not None:
         return None
-    edge = model_prob - rest
+    edge = net_edge(model_prob, rest, STAKE_NOTIONAL, maker=True)
     if edge < MIN_EDGE:
         return None
     return rest, edge
+
+
+def _advisor_fee_mode() -> str:
+    """Fee assumption used when deciding whether a quote clears MIN_EDGE."""
+    if LIVE_TRADING or LIVE_DRY_RUN:
+        if LIVE_ORDER_MODE == "maker":
+            return "maker"
+        return "taker"
+    return PAPER_FEE_MODE
 
 
 def _print_status(
@@ -356,12 +380,16 @@ def _limit_price_with_tolerance(
     """Highest price worth bidding for this side.
 
     Willing to pay a little above the displayed ask so a one-cent tick doesn't
-    cost the trade, but never past the point where the edge drops below
-    ``min_edge``. Rounded down to a whole cent to stay on Kalshi's tick grid.
+    cost the trade, but never past the point where *net* edge (after taker
+    fees) drops below ``min_edge``. Rounded down to a whole cent.
     """
     if tolerance <= 0:
         return ask
-    edge_ceiling = model_prob - min_edge
+    # Approximate fee at the ask; enough to keep the ceiling honest.
+    from config.kalshi_fees import fee_per_contract as _fpc
+
+    fee = _fpc(ask, STAKE_NOTIONAL, maker=False)
+    edge_ceiling = model_prob - min_edge - fee
     limit = min(ask + tolerance, edge_ceiling)
     limit = math.floor(limit * 100.0) / 100.0
     # Never bid below the ask we already qualified on
@@ -476,8 +504,13 @@ async def run_bot(
     if LIVE_TRADING or LIVE_DRY_RUN:
         print(
             f"  Live pricing    : orderbook-first | mode {LIVE_ORDER_MODE} | "
-            f"rest {LIVE_REST_SECONDS:.0f}s"
+            f"rest {LIVE_REST_SECONDS:.0f}s | any-side "
+            f"{'ON' if MAKER_ANY_SIDE else 'OFF'}"
         )
+    print(
+        f"  Fee model       : edge+paper use {_advisor_fee_mode()} "
+        f"(paper env {PAPER_FEE_MODE})"
+    )
     print(
         f"  Stake notional  : ${STAKE_NOTIONAL:,.2f} face "
         f"(pay share_price × {STAKE_NOTIONAL:g} contracts)"
@@ -537,6 +570,7 @@ async def run_bot(
         vault_withdraw_amount=VAULT_WITHDRAW_AMOUNT,
         vault_goal=VAULT_GOAL,
         engine=engine,
+        fee_mode=_advisor_fee_mode(),
     )
 
     if LIVE_TRADING:
@@ -595,6 +629,8 @@ async def run_bot(
         max_entry_price=MAX_ENTRY_PRICE,
         min_model_prob=MIN_MODEL_PROB,
         max_model_prob=MAX_MODEL_PROB,
+        stake_notional=STAKE_NOTIONAL,
+        fee_mode=_advisor_fee_mode(),
     )
     backup_now(database_url=settings.database_url)
     if notifier.active:
@@ -778,13 +814,73 @@ async def run_bot(
                 live_attempts.pop(expired.window_id, None)
                 live_filled_windows.discard(expired.window_id)
                 if resting is not None and live_exec is not None:
-                    # Never let an order outlive the window it was priced for
-                    await asyncio.to_thread(live_exec.cancel_resting, resting)
-                    print(
-                        f"[{_utcnow_label()}] LIVE cancelled resting order "
-                        f"at window close ({resting.advice_side} "
-                        f"@{resting.limit_price*100:.0f}¢)"
+                    # Poll fills BEFORE cancel. A hit at the bell used to leave
+                    # Kalshi risk with no book row (silent P/L drift).
+                    rest_fill = await asyncio.to_thread(
+                        live_exec.poll_resting, resting
                     )
+                    if rest_fill is not None:
+                        live_filled_windows.add(resting.window_id)
+                        live_fill_count += 1
+                        print(
+                            f"[{_utcnow_label()}] LIVE RESTING FILLED at close "
+                            f"{resting.advice_side} {rest_fill.contracts:g} @ "
+                            f"{rest_fill.price_paid*100:.1f}¢"
+                        )
+                        if (
+                            resting_advice is not None
+                            and resting_window is not None
+                            and book.get_open_bet(resting.window_id) is None
+                        ):
+                            placed = book.place_bet(
+                                resting_window,
+                                resting_advice,
+                                contract_price=rest_fill.price_paid,
+                                stake_notional=rest_fill.contracts,
+                                price_includes_fees=True,
+                            )
+                            if placed is not None:
+                                notifier.bet_placed(
+                                    placed, reason=resting_advice.reason
+                                )
+                    cancelled = await asyncio.to_thread(
+                        live_exec.cancel_resting, resting
+                    )
+                    if not cancelled:
+                        # Cancel often fails because it already filled — poll again.
+                        late_fill = await asyncio.to_thread(
+                            live_exec.poll_resting, resting
+                        )
+                        if (
+                            late_fill is not None
+                            and resting_advice is not None
+                            and resting_window is not None
+                            and book.get_open_bet(resting.window_id) is None
+                        ):
+                            live_filled_windows.add(resting.window_id)
+                            placed = book.place_bet(
+                                resting_window,
+                                resting_advice,
+                                contract_price=late_fill.price_paid,
+                                stake_notional=late_fill.contracts,
+                                price_includes_fees=True,
+                            )
+                            if placed is not None:
+                                notifier.bet_placed(
+                                    placed, reason=resting_advice.reason
+                                )
+                                print(
+                                    f"[{_utcnow_label()}] LIVE RESTING FILLED "
+                                    f"after cancel race {resting.advice_side} "
+                                    f"{late_fill.contracts:g} @ "
+                                    f"{late_fill.price_paid*100:.1f}¢"
+                                )
+                    else:
+                        print(
+                            f"[{_utcnow_label()}] LIVE cancelled resting order "
+                            f"at window close ({resting.advice_side} "
+                            f"@{resting.limit_price*100:.0f}¢)"
+                        )
                     resting = None
                     resting_advice = None
                     resting_window = None
@@ -866,8 +962,9 @@ async def run_bot(
                     seconds_remaining=window.seconds_remaining(),
                     prob_above=advice.prob_above,
                     prob_below=advice.prob_below,
-                    yes_ask=yes_ask,
-                    no_ask=no_ask,
+                    # Log the asks the decision actually used (orderbook when live).
+                    yes_ask=advise_yes,
+                    no_ask=advise_no,
                     action=advice.action,
                     edge=advice.edge,
                 )
@@ -896,11 +993,26 @@ async def run_bot(
 
                     waited = datetime.now(timezone.utc).timestamp() - closed_at
                     if outcome_side is None:
-                        if SETTLE_REQUIRE_OFFICIAL and waited < SETTLE_WAIT_SECONDS:
+                        # Live cash must match Kalshi. Never invent a Coinbase
+                        # outcome while real orders are armed — keep waiting.
+                        keep_waiting = (
+                            SETTLE_REQUIRE_OFFICIAL
+                            and (
+                                LIVE_TRADING
+                                or waited < SETTLE_WAIT_SECONDS
+                            )
+                        )
+                        if keep_waiting:
+                            if LIVE_TRADING and waited >= SETTLE_WAIT_SECONDS:
+                                print(
+                                    f"[{_utcnow_label()}] LIVE still waiting on "
+                                    f"Kalshi result for {closed.window_id} "
+                                    f"({waited:.0f}s) — not settling from spot"
+                                )
                             still_pending.append((closed, closed_ticker, closed_at))
                             continue
-                        # Out of patience. Our own spot disagrees with Kalshi near
-                        # the strike, so say so loudly rather than book it quietly.
+                        # Paper-only patience exhausted. Spot can disagree near
+                        # the strike, so say so loudly rather than book quietly.
                         outcome_side = None
                         settle_price = float(closed.settlement_price or price)
                         settle_source = "coinbase_spot_fallback"
@@ -975,6 +1087,7 @@ async def run_bot(
                             resting_advice,
                             contract_price=rest_fill.price_paid,
                             stake_notional=rest_fill.contracts,
+                            price_includes_fees=True,
                         )
                         if placed is not None:
                             notifier.bet_placed(placed, reason=resting_advice.reason)
@@ -984,15 +1097,89 @@ async def run_bot(
                     resting_advice = None
                     resting_window = None
                 elif resting.is_expired() or resting.window_id != window.window_id:
-                    await asyncio.to_thread(live_exec.cancel_resting, resting)
-                    live_miss_count += 1
-                    total_orders = live_fill_count + live_miss_count
-                    print(
-                        f"[{_utcnow_label()}] LIVE resting expired unfilled "
-                        f"({resting.advice_side} @{resting.limit_price*100:.0f}¢) | "
-                        f"fill rate {live_fill_count}/{total_orders} "
-                        f"({live_fill_count / total_orders * 100:.0f}%)"
+                    # Final fill check before treating as a miss.
+                    late_fill = await asyncio.to_thread(
+                        live_exec.poll_resting, resting
                     )
+                    if late_fill is not None:
+                        live_filled_windows.add(resting.window_id)
+                        live_fill_count += 1
+                        if (
+                            resting_advice is not None
+                            and resting_window is not None
+                            and book.get_open_bet(resting.window_id) is None
+                        ):
+                            placed = book.place_bet(
+                                resting_window,
+                                resting_advice,
+                                contract_price=late_fill.price_paid,
+                                stake_notional=late_fill.contracts,
+                                price_includes_fees=True,
+                            )
+                            if placed is not None:
+                                notifier.bet_placed(
+                                    placed, reason=resting_advice.reason
+                                )
+                                print(
+                                    f"[{_utcnow_label()}] LIVE RESTING FILLED "
+                                    f"on expiry poll {resting.advice_side} "
+                                    f"{late_fill.contracts:g} @ "
+                                    f"{late_fill.price_paid*100:.1f}¢"
+                                )
+                        cancelled = await asyncio.to_thread(
+                            live_exec.cancel_resting, resting
+                        )
+                    else:
+                        cancelled = await asyncio.to_thread(
+                            live_exec.cancel_resting, resting
+                        )
+                        if not cancelled:
+                            race_fill = await asyncio.to_thread(
+                                live_exec.poll_resting, resting
+                            )
+                            if (
+                                race_fill is not None
+                                and resting_advice is not None
+                                and resting_window is not None
+                                and book.get_open_bet(resting.window_id) is None
+                            ):
+                                live_filled_windows.add(resting.window_id)
+                                live_fill_count += 1
+                                placed = book.place_bet(
+                                    resting_window,
+                                    resting_advice,
+                                    contract_price=race_fill.price_paid,
+                                    stake_notional=race_fill.contracts,
+                                    price_includes_fees=True,
+                                )
+                                if placed is not None:
+                                    notifier.bet_placed(
+                                        placed, reason=resting_advice.reason
+                                    )
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE RESTING FILLED "
+                                        f"after cancel race {resting.advice_side} "
+                                        f"{race_fill.contracts:g} @ "
+                                        f"{race_fill.price_paid*100:.1f}¢"
+                                    )
+                            else:
+                                live_miss_count += 1
+                                total_orders = live_fill_count + live_miss_count
+                                print(
+                                    f"[{_utcnow_label()}] LIVE resting expired unfilled "
+                                    f"({resting.advice_side} @{resting.limit_price*100:.0f}¢) | "
+                                    f"fill rate {live_fill_count}/{total_orders} "
+                                    f"({live_fill_count / total_orders * 100:.0f}%)"
+                                )
+                        else:
+                            live_miss_count += 1
+                            total_orders = live_fill_count + live_miss_count
+                            print(
+                                f"[{_utcnow_label()}] LIVE resting expired unfilled "
+                                f"({resting.advice_side} @{resting.limit_price*100:.0f}¢) | "
+                                f"fill rate {live_fill_count}/{total_orders} "
+                                f"({live_fill_count / total_orders * 100:.0f}%)"
+                            )
                     resting = None
                     resting_advice = None
                     resting_window = None
@@ -1006,7 +1193,10 @@ async def run_bot(
                 AUTO_BET
                 and resting is None
                 and book.get_open_bet(window.window_id) is None
-                and (advice.should_bet or can_live_maker)
+                and (
+                    advice.should_bet
+                    or (can_live_maker and MAKER_ANY_SIDE)
+                )
             ):
                 print()
                 # Optional live rehearsal / (gated) live submit
@@ -1051,22 +1241,34 @@ async def run_bot(
                             depth_note = ""
 
                             if LIVE_ORDER_MODE == "maker":
-                                if book_now is None:
+                                remain = window.seconds_remaining()
+                                min_maker_remain = max(
+                                    MIN_SECONDS_TO_BET, LIVE_REST_SECONDS
+                                )
+                                if remain < min_maker_remain:
+                                    note_skip("too close for maker")
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — only "
+                                        f"{remain:.0f}s left, need "
+                                        f"{min_maker_remain:.0f}s to rest"
+                                    )
+                                elif book_now is None:
                                     note_skip("no bid to join")
                                     print(
                                         f"[{_utcnow_label()}] LIVE skip — no "
                                         f"orderbook to rest on for {ticker}"
                                     )
                                 else:
-                                    # Prefer the advisor side when it already
-                                    # cleared ask-edge; otherwise try both legs
-                                    # for a bid we can join with real edge.
+                                    # Default: only the advisor side (ask-edge
+                                    # already cleared). MAKER_ANY_SIDE=true
+                                    # also tries the other leg for volume.
                                     side_order: list[str] = []
                                     if advice.should_bet:
                                         side_order.append(advice.action)
-                                    for side in ("ABOVE", "BELOW"):
-                                        if side not in side_order:
-                                            side_order.append(side)
+                                    if MAKER_ANY_SIDE:
+                                        for side in ("ABOVE", "BELOW"):
+                                            if side not in side_order:
+                                                side_order.append(side)
                                     chosen: Optional[
                                         tuple[str, float, float, float]
                                     ] = None
@@ -1135,8 +1337,8 @@ async def run_bot(
                                                 f"{depth_note}"
                                             )
                             elif advice.should_bet and advice.entry_share_price is not None:
-                                # Taker: cross the real ask (already preferred
-                                # in advice when orderbook-first is on).
+                                # Taker: require a readable book and re-check
+                                # net edge + entry bounds at submit time.
                                 ask_now = float(advice.entry_share_price)
                                 model_now = float(
                                     advice.prob_above
@@ -1144,29 +1346,56 @@ async def run_bot(
                                     else advice.prob_below
                                 )
                                 send_order = True
-                                if book_now is not None:
-                                    true_ask = book_now.ask_for(advice.action)
-                                    fresh_edge = (
-                                        model_now - true_ask
-                                        if true_ask is not None
-                                        else None
+                                if book_now is None:
+                                    send_order = False
+                                    note_skip("no orderbook")
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE skip — no "
+                                        f"orderbook for taker on {ticker}"
                                     )
+                                else:
+                                    true_ask = book_now.ask_for(advice.action)
                                     if true_ask is None:
-                                        depth_note = " (book unreadable, using advice ask)"
-                                    elif fresh_edge is not None and fresh_edge < MIN_EDGE:
                                         send_order = False
-                                        note_skip("edge gone on real book")
+                                        note_skip("no orderbook")
                                         print(
-                                            f"[{_utcnow_label()}] LIVE skip — edge gone "
-                                            f"at real ask {true_ask*100:.0f}¢ "
-                                            f"(edge {fresh_edge*100:+.1f}¢)"
+                                            f"[{_utcnow_label()}] LIVE skip — empty "
+                                            f"{advice.action} ask on {ticker}"
                                         )
                                     else:
-                                        depth = book_now.depth_for(advice.action)
-                                        depth_note = (
-                                            f" book {true_ask*100:.0f}¢ x{depth:g}"
-                                        )
                                         ask_now = true_ask
+                                        bound = _bound_skip_reason(
+                                            entry=ask_now, model_prob=model_now
+                                        )
+                                        fresh_edge = net_edge(
+                                            model_now,
+                                            ask_now,
+                                            STAKE_NOTIONAL,
+                                            maker=False,
+                                        )
+                                        if bound is not None:
+                                            send_order = False
+                                            note_skip("bounds on real book")
+                                            print(
+                                                f"[{_utcnow_label()}] LIVE skip — "
+                                                f"{bound} at submit"
+                                            )
+                                        elif fresh_edge < MIN_EDGE:
+                                            send_order = False
+                                            note_skip("edge gone on real book")
+                                            print(
+                                                f"[{_utcnow_label()}] LIVE skip — "
+                                                f"net edge gone at real ask "
+                                                f"{true_ask*100:.0f}¢ "
+                                                f"(edge {fresh_edge*100:+.1f}¢)"
+                                            )
+                                        else:
+                                            depth = book_now.depth_for(advice.action)
+                                            depth_note = (
+                                                f" book {true_ask*100:.0f}¢ "
+                                                f"x{depth:g} net "
+                                                f"{fresh_edge*100:.1f}¢"
+                                            )
                                 if send_order:
                                     bid_price = _limit_price_with_tolerance(
                                         ask=ask_now, model_prob=model_now
@@ -1215,18 +1444,29 @@ async def run_bot(
                 # this, live mode would track no W/L, P/L, settlement or vault.
                 record_price: Optional[float] = advice.entry_share_price
                 record_qty: float = STAKE_NOTIONAL
+                live_price_includes_fees = False
                 if LIVE_TRADING:
                     # Only a real fill becomes a position; a miss is not a bet.
                     if live_filled and live_plan is not None:
                         record_price = live_plan.effective_price
                         record_qty = float(live_plan.fill_count)
-                        # A fill should cost roughly what we bid. A large gap
-                        # means the price was read off the wrong leg.
+                        live_price_includes_fees = True
+                        # A fill should cost roughly what we bid (+ fee). A
+                        # large gap means the price was read off the wrong leg.
                         intended = float(live_plan.share_price)
-                        if (
-                            record_price is not None
-                            and abs(record_price - intended) > 0.10
-                        ):
+                        if record_price is None:
+                            # Still book something — orphan Kalshi risk is worse
+                            # than a fee estimate.
+                            from config.kalshi_fees import fee_per_contract as _fpc
+
+                            record_price = intended + _fpc(
+                                intended, max(record_qty, 1.0), maker=False
+                            )
+                            print(
+                                f"[{_utcnow_label()}] WARNING: fill price missing; "
+                                f"booking limit+est fee {record_price*100:.1f}¢"
+                            )
+                        elif abs(record_price - intended) > 0.12:
                             print(
                                 f"[{_utcnow_label()}] WARNING: booked "
                                 f"{record_price*100:.1f}¢ for a {intended*100:.1f}¢ "
@@ -1243,6 +1483,7 @@ async def run_bot(
                         advice,
                         contract_price=record_price,
                         stake_notional=record_qty,
+                        price_includes_fees=live_price_includes_fees,
                     )
                     if placed is not None:
                         notifier.bet_placed(placed, reason=advice.reason)
@@ -1325,8 +1566,28 @@ async def run_bot(
         if tape is not None:
             await tape.stop()
         if resting is not None and live_exec is not None:
-            # Don't leave a live order on the book after the process stops
+            # Poll fills before cancel so a last-second hit is booked.
             try:
+                rest_fill = await asyncio.to_thread(live_exec.poll_resting, resting)
+                if (
+                    rest_fill is not None
+                    and resting_advice is not None
+                    and resting_window is not None
+                    and book.get_open_bet(resting.window_id) is None
+                ):
+                    placed = book.place_bet(
+                        resting_window,
+                        resting_advice,
+                        contract_price=rest_fill.price_paid,
+                        stake_notional=rest_fill.contracts,
+                        price_includes_fees=True,
+                    )
+                    if placed is not None:
+                        print(
+                            f"[{_utcnow_label()}] Booked resting fill on shutdown "
+                            f"{resting.advice_side} {rest_fill.contracts:g} @ "
+                            f"{rest_fill.price_paid*100:.1f}¢"
+                        )
                 await asyncio.to_thread(live_exec.cancel_resting, resting)
                 print(f"[{_utcnow_label()}] Cancelled resting order on shutdown")
             except Exception as exc:  # noqa: BLE001 — shutdown must not raise
