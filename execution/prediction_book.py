@@ -10,6 +10,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import load_settings
+from config.kalshi_fees import order_fee
 from models.db import create_db_engine, create_session_factory, init_db
 from models.prediction import PredictionBankroll, PredictionBet
 from prediction.advisor import Advice
@@ -55,6 +56,9 @@ class PredictionBook:
         vault_withdraw_amount: float = 50.0,
         vault_goal: float = 300.0,
         engine=None,
+        # Paper used to ignore exchange fees, which made it look more
+        # profitable than live. Default taker matches crossing the ask.
+        fee_mode: str = "taker",
     ) -> None:
         settings = load_settings()
         self.session_factory = session_factory
@@ -65,6 +69,7 @@ class PredictionBook:
         )
         self.symbol = symbol or settings.symbol
         self.stake_notional = max(0.01, float(stake_notional))
+        self.fee_mode = (fee_mode or "none").strip().lower()
         self.vault_enabled = bool(vault_enabled)
         self.vault_working_bank = float(
             self.initial_balance if vault_working_bank is None else vault_working_bank
@@ -237,11 +242,16 @@ class PredictionBook:
             ).first()
 
     @staticmethod
-    def _tradable_share_price(price: Optional[float]) -> Optional[float]:
+    @staticmethod
+    def _tradable_share_price(
+        price: Optional[float], *, all_in: bool = False
+    ) -> Optional[float]:
         if price is None:
             return None
         value = float(price)
-        if value < 0.02 or value > 0.98:
+        # All-in (fee-inclusive) live fills can sit a hair above 98¢.
+        hi = 1.10 if all_in else 0.98
+        if value < 0.02 or value > hi:
             return None
         return value
 
@@ -253,6 +263,7 @@ class PredictionBook:
         market_prob_above: Optional[float] = None,
         contract_price: Optional[float] = None,
         stake_notional: Optional[float] = None,
+        price_includes_fees: bool = False,
     ) -> Optional[PredictionBet]:
         if not advice.should_bet:
             return None
@@ -261,9 +272,13 @@ class PredictionBook:
 
         # Prefer explicit ask for the chosen side; never invent a 1¢ fill
         if contract_price is not None:
-            share_price = self._tradable_share_price(contract_price)
+            share_price = self._tradable_share_price(
+                contract_price, all_in=price_includes_fees
+            )
+            quote_price = float(contract_price) if share_price is not None else None
         elif advice.entry_share_price is not None:
             share_price = self._tradable_share_price(advice.entry_share_price)
+            quote_price = share_price
         elif market_prob_above is not None:
             raw = (
                 float(market_prob_above)
@@ -271,10 +286,12 @@ class PredictionBook:
                 else (1.0 - float(market_prob_above))
             )
             share_price = self._tradable_share_price(raw)
+            quote_price = share_price
         else:
             share_price = None
+            quote_price = None
 
-        if share_price is None:
+        if share_price is None or quote_price is None:
             self._log(
                 "Bet skipped | no tradable share ask "
                 f"for {advice.action} (refusing empty/0¢/100¢ book)"
@@ -285,7 +302,18 @@ class PredictionBook:
         notional = max(0.01, notional)
         # Each contract pays $1 face → quantity equals notional dollars
         quantity = notional
-        total_cost = quantity * share_price
+        fee_total = 0.0
+        all_in_price = quote_price
+        if not price_includes_fees and self.fee_mode not in {"", "none", "off", "0"}:
+            fee_total = order_fee(
+                quote_price,
+                quantity,
+                maker=self.fee_mode == "maker",
+            )
+            all_in_price = quote_price + (fee_total / quantity)
+        total_cost = quantity * quote_price + fee_total
+        # Store all-in price so calibration's (WR - avg_price) matches cash P/L.
+        share_price = all_in_price
         total_payout = quantity * 1.0  # cash returned if correct (includes stake)
 
         with self.session_factory() as session:

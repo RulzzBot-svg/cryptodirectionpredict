@@ -7,13 +7,13 @@ dry-run only logs the payload; live submit requires the live gate to pass.
 from __future__ import annotations
 
 import logging
-import math
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError
+from config.kalshi_fees import fee_amount_to_dollars, maker_fee
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,6 @@ def _price_to_dollars(raw: Any) -> Optional[float]:
     if value <= 0:
         return None
     return value / 100.0 if value >= 1.0 else value
-
-
-def maker_fee(price: float, contracts: float) -> float:
-    """Kalshi maker fee for an order: 0.0175 * C * P * (1-P), rounded up."""
-    raw = 0.0175 * float(contracts) * price * (1.0 - price)
-    return math.ceil(raw * 100.0) / 100.0
 
 
 @dataclass(frozen=True)
@@ -117,8 +111,13 @@ class LiveOrderPlan:
             return None
         fill = float(self.average_fill_price)
         paid = fill if self.advice_side == "ABOVE" else 1.0 - fill
-        paid += float(self.average_fee_paid or 0.0)
-        if not 0.0 < paid < 1.0:
+        fee = fee_amount_to_dollars(self.average_fee_paid)
+        if fee is None:
+            fee = 0.0
+        # average_fee_paid is per contract when present
+        paid += fee
+        # All-in can exceed 98¢ once fees are included; still refuse nonsense.
+        if not 0.0 < paid <= 1.10:
             logger.error(
                 "Implausible fill price for %s %s: fill=%s fee=%s -> %s",
                 self.advice_side,
@@ -310,7 +309,12 @@ class LiveKalshiExecutor:
                 )
             if price is None:
                 continue
-            fee_total = _price_to_dollars(fill.get("fee"))
+            # Prefer fee_cost / fee_cost_dollars (Kalshi's real field). The
+            # legacy ``fee`` key is usually absent, which used to force an
+            # estimate even when the exchange reported the true fee.
+            fee_total = fee_amount_to_dollars(
+                fill.get("fee_cost", fill.get("fee_cost_dollars", fill.get("fee")))
+            )
             if fee_total is None:
                 fee_total = maker_fee(price, qty)
             per_contract_fee = fee_total / qty if qty else 0.0
@@ -410,9 +414,9 @@ class LiveKalshiExecutor:
         fill = float(raw.get("fill_count") or 0)
         rem = float(raw.get("remaining_count") or 0)
         avg = raw.get("average_fill_price")
-        avg_f = float(avg) if avg is not None else None
-        fee = raw.get("average_fee_paid")
-        fee_f = float(fee) if fee is not None else None
+        avg_f = _price_to_dollars(avg) if avg is not None else None
+        # Keep per-contract fee in dollars for effective_price.
+        fee_f = fee_amount_to_dollars(raw.get("average_fee_paid"))
         return LiveOrderPlan(
             market_ticker=plan.market_ticker,
             advice_side=plan.advice_side,

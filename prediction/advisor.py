@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+from config.kalshi_fees import fee_per_contract, net_edge
+
 from .probability import ProbabilityEstimate, estimate_prob_above
 from .window import PredictionWindow
 
@@ -43,9 +45,9 @@ class PredictionAdvisor:
     """
     Recommend a side when model edge vs live share asks is large enough.
 
-    Edge is measured against the price you would pay:
-      ABOVE edge = P(above) - yes_ask
-      BELOW edge = P(below) - no_ask
+    Edge is measured against the price you would pay, after estimated fees:
+      ABOVE edge = P(above) - yes_ask - fee/contract
+      BELOW edge = P(below) - no_ask - fee/contract
 
     Optional bounds kill the two buckets that keep showing up as losers:
       - cheap longshots (low ask / low model prob)
@@ -65,6 +67,8 @@ class PredictionAdvisor:
         max_entry_price: float = 0.0,
         min_model_prob: float = 0.0,
         max_model_prob: float = 0.0,
+        stake_notional: float = 5.0,
+        fee_mode: str = "taker",  # taker | maker | none
     ) -> None:
         self.min_edge = min_edge
         self.market_prob_above = market_prob_above
@@ -75,6 +79,8 @@ class PredictionAdvisor:
         self.max_entry_price = float(max_entry_price or 0.0)
         self.min_model_prob = float(min_model_prob or 0.0)
         self.max_model_prob = float(max_model_prob or 0.0)
+        self.stake_notional = max(float(stake_notional), 0.01)
+        self.fee_mode = (fee_mode or "taker").strip().lower()
 
     @staticmethod
     def _valid_ask(value: Optional[float]) -> Optional[float]:
@@ -85,6 +91,22 @@ class PredictionAdvisor:
         if price < 0.02 or price > 0.98:
             return None
         return price
+
+    def _fee_drag(self, price: float) -> float:
+        if self.fee_mode in {"", "none", "off", "0"}:
+            return 0.0
+        maker = self.fee_mode == "maker"
+        return fee_per_contract(price, self.stake_notional, maker=maker)
+
+    def _net_edge(self, model_prob: float, price: float) -> float:
+        if self.fee_mode in {"", "none", "off", "0"}:
+            return float(model_prob) - float(price)
+        return net_edge(
+            model_prob,
+            price,
+            self.stake_notional,
+            maker=self.fee_mode == "maker",
+        )
 
     def _filter_skip_reason(self, *, model_prob: float, entry: float) -> Optional[str]:
         """Return a human skip reason when a candidate bet is out of bounds."""
@@ -201,8 +223,8 @@ class PredictionAdvisor:
             )
 
         assert yes is not None and no is not None
-        edge_above = estimate.prob_above - yes
-        edge_below = estimate.prob_below - no
+        edge_above = self._net_edge(estimate.prob_above, yes)
+        edge_below = self._net_edge(estimate.prob_below, no)
 
         action: Side = "SKIP"
         edge = 0.0
@@ -215,18 +237,22 @@ class PredictionAdvisor:
             edge = edge_above
             model_prob = estimate.prob_above
             entry = yes
+            fee_cents = self._fee_drag(yes) * 100.0
             reason = (
                 f"model {estimate.prob_above_pct:.1f}% ABOVE vs YES ask "
-                f"{yes * 100:.1f}¢ (edge {edge_above * 100:.1f}¢)"
+                f"{yes * 100:.1f}¢ (net edge {edge_above * 100:.1f}¢"
+                f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
             )
         elif edge_below >= self.min_edge:
             action = "BELOW"
             edge = edge_below
             model_prob = estimate.prob_below
             entry = no
+            fee_cents = self._fee_drag(no) * 100.0
             reason = (
                 f"model {estimate.prob_below_pct:.1f}% BELOW vs NO ask "
-                f"{no * 100:.1f}¢ (edge {edge_below * 100:.1f}¢)"
+                f"{no * 100:.1f}¢ (net edge {edge_below * 100:.1f}¢"
+                f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
             )
         else:
             best_edge = max(edge_above, edge_below)
@@ -234,7 +260,7 @@ class PredictionAdvisor:
                 estimate,
                 edge=best_edge,
                 reason=(
-                    f"no edge (best {best_edge * 100:+.1f}¢, need "
+                    f"no net edge (best {best_edge * 100:+.1f}¢ after fees, need "
                     f"{self.min_edge * 100:.0f}¢)"
                 ),
                 yes=yes,
