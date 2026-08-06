@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -42,6 +43,7 @@ from data.backup import backup_now, restore_latest_backup
 from data.calibration import CalibrationLog
 from data.feed import close_exchange, create_rest_exchange, fetch_latest_snapshot
 from data.kalshi import (
+    KalshiBook,
     fetch_current_btc_15m,
     fetch_orderbook,
     fetch_window_settlement,
@@ -185,6 +187,69 @@ def _read_number_file(path: Path) -> Optional[float]:
         return _parse_number(path.read_text(encoding="utf-8"))
     except OSError:
         return None
+
+
+def _cent_floor(price: float) -> float:
+    return math.floor(float(price) * 100.0 + 1e-9) / 100.0
+
+
+def _bound_skip_reason(*, entry: float, model_prob: float) -> Optional[str]:
+    """Match advisor entry/model bounds for live maker quotes."""
+    if MIN_ENTRY_PRICE > 0 and entry < MIN_ENTRY_PRICE:
+        return (
+            f"ask {entry * 100:.1f}¢ below min "
+            f"{MIN_ENTRY_PRICE * 100:.0f}¢"
+        )
+    if MAX_ENTRY_PRICE > 0 and entry > MAX_ENTRY_PRICE:
+        return (
+            f"ask {entry * 100:.1f}¢ above max "
+            f"{MAX_ENTRY_PRICE * 100:.0f}¢"
+        )
+    if MIN_MODEL_PROB > 0 and model_prob < MIN_MODEL_PROB:
+        return (
+            f"model {model_prob * 100:.1f}% below min "
+            f"{MIN_MODEL_PROB * 100:.0f}%"
+        )
+    if MAX_MODEL_PROB > 0 and model_prob > MAX_MODEL_PROB:
+        return (
+            f"model {model_prob * 100:.1f}% above max "
+            f"{MAX_MODEL_PROB * 100:.0f}%"
+        )
+    return None
+
+
+def _maker_rest_candidate(
+    *,
+    side: str,
+    model_prob: float,
+    book: KalshiBook,
+) -> Optional[tuple[float, float]]:
+    """Return (rest_price, edge) when a maker quote clears edge + bounds.
+
+    Maker edge is versus the resting bid price, not the ask. Requiring ask
+    edge first was killing live volume: the book ask is often stale/wide
+    while joining the bid still leaves a real edge.
+    """
+    best_bid = book.bid_for(side)
+    ask = book.ask_for(side)
+    if best_bid is None or ask is None:
+        return None
+    rest = min(best_bid + 0.01, ask - 0.01, model_prob - MIN_EDGE)
+    rest = _cent_floor(rest)
+    # Never rest below the configured floor (the 43¢ maker leak).
+    if MIN_ENTRY_PRICE > 0 and rest < MIN_ENTRY_PRICE:
+        if MIN_ENTRY_PRICE < ask - 1e-9 and model_prob - MIN_ENTRY_PRICE >= MIN_EDGE:
+            rest = _cent_floor(MIN_ENTRY_PRICE)
+        else:
+            return None
+    if rest < 0.01:
+        return None
+    if _bound_skip_reason(entry=rest, model_prob=model_prob) is not None:
+        return None
+    edge = model_prob - rest
+    if edge < MIN_EDGE:
+        return None
+    return rest, edge
 
 
 def _print_status(
@@ -408,6 +473,11 @@ async def run_bot(
         )
     else:
         print("  Market YES/NO   : live Kalshi asks (skip if empty/0¢)")
+    if LIVE_TRADING or LIVE_DRY_RUN:
+        print(
+            f"  Live pricing    : orderbook-first | mode {LIVE_ORDER_MODE} | "
+            f"rest {LIVE_REST_SECONDS:.0f}s"
+        )
     print(
         f"  Stake notional  : ${STAKE_NOTIONAL:,.2f} face "
         f"(pay share_price × {STAKE_NOTIONAL:g} contracts)"
@@ -752,13 +822,35 @@ async def run_bot(
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
 
+            # Live decisions use the real orderbook asks. The market snapshot
+            # is often a few cents soft, which manufactured fake edges and then
+            # died at order time ("edge gone on real book") — so live barely
+            # filled while paper looked busy.
+            advise_yes = yes_ask
+            advise_no = no_ask
+            live_book: Optional[KalshiBook] = None
+            if (
+                (LIVE_TRADING or LIVE_DRY_RUN)
+                and live_exec is not None
+                and kalshi_market_ticker.strip()
+                and not market_locked
+            ):
+                live_book = await asyncio.to_thread(
+                    fetch_orderbook, kalshi_market_ticker.strip()
+                )
+                if live_book is not None:
+                    if live_book.yes_ask is not None:
+                        advise_yes = live_book.yes_ask
+                    if live_book.no_ask is not None:
+                        advise_no = live_book.no_ask
+
             advice = advisor.advise(
                 window,
                 price,
                 snapshot["candles"],
                 market_prob_above=market_prob_above,
-                yes_ask=yes_ask,
-                no_ask=no_ask,
+                yes_ask=advise_yes,
+                no_ask=advise_no,
             )
 
             now_ts = datetime.now(timezone.utc).timestamp()
@@ -905,17 +997,22 @@ async def run_bot(
                     resting_advice = None
                     resting_window = None
 
+            can_live_maker = (
+                LIVE_TRADING
+                and live_exec is not None
+                and LIVE_ORDER_MODE == "maker"
+            )
             if (
                 AUTO_BET
-                and advice.should_bet
                 and resting is None
                 and book.get_open_bet(window.window_id) is None
+                and (advice.should_bet or can_live_maker)
             ):
                 print()
                 # Optional live rehearsal / (gated) live submit
                 live_filled = False
                 live_plan = None
-                if live_exec is not None and advice.entry_share_price is not None:
+                if live_exec is not None:
                     ticker = kalshi_market_ticker.strip()
                     attempts = live_attempts.get(window.window_id, 0)
                     if not ticker:
@@ -946,148 +1043,173 @@ async def run_bot(
                                 f"{held:g} on {ticker}"
                             )
                         else:
-                            ask_now = float(advice.entry_share_price)
-                            model_now = float(
-                                advice.prob_above
-                                if advice.action == "ABOVE"
-                                else advice.prob_below
-                            )
-                            # The snapshot ask is derived and often stale. Price
-                            # off the real book instead, fetched right now.
-                            book_now = await asyncio.to_thread(
-                                fetch_orderbook, ticker
-                            )
+                            book_now = live_book
+                            if book_now is None:
+                                book_now = await asyncio.to_thread(
+                                    fetch_orderbook, ticker
+                                )
                             depth_note = ""
-                            send_order = True
-                            if book_now is not None:
-                                true_ask = book_now.ask_for(advice.action)
-                                fresh_edge = (
-                                    model_now - true_ask if true_ask is not None else None
-                                )
-                                if true_ask is None:
-                                    # Unreadable book is not evidence of a bad
-                                    # price. Fall back to the snapshot rather
-                                    # than refusing to trade at all.
-                                    depth_note = " (book unreadable, using snapshot)"
-                                elif fresh_edge is not None and fresh_edge < MIN_EDGE:
-                                    send_order = False
-                                    note_skip("edge gone on real book")
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE skip — edge gone "
-                                        f"at real ask {true_ask*100:.0f}¢ "
-                                        f"(snapshot said {ask_now*100:.0f}¢, "
-                                        f"edge {fresh_edge*100:+.1f}¢)"
-                                    )
-                                else:
-                                    depth = book_now.depth_for(advice.action)
-                                    depth_note = f" book {true_ask*100:.0f}¢ x{depth:g}"
-                                    ask_now = true_ask
 
-                            if not send_order:
-                                # Deciding not to order is not an attempt. Only
-                                # submitted orders count, or a few bad ticks
-                                # would lock the bot out of the whole window.
-                                pass
-                            elif LIVE_ORDER_MODE == "maker":
-                                # A maker order sits on the BID. Resting at the
-                                # ask would cross, and post_only would reject it.
-                                best_bid = (
-                                    book_now.bid_for(advice.action)
-                                    if book_now is not None
-                                    else None
-                                )
-                                if best_bid is None:
+                            if LIVE_ORDER_MODE == "maker":
+                                if book_now is None:
                                     note_skip("no bid to join")
                                     print(
                                         f"[{_utcnow_label()}] LIVE skip — no "
-                                        f"{advice.action} bid to join on {ticker}"
-                                    )
-                                    await asyncio.sleep(LOOP_INTERVAL_SECONDS)
-                                    continue
-                                # Improve on the best bid by a tick when the
-                                # spread allows, but never reach the ask.
-                                rest_price = min(
-                                    best_bid + 0.01,
-                                    ask_now - 0.01,
-                                    model_now - MIN_EDGE,
-                                )
-                                rest_price = math.floor(rest_price * 100.0) / 100.0
-                                if rest_price < 0.01:
-                                    note_skip("no maker price with edge")
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE skip — no maker "
-                                        f"price leaves {MIN_EDGE*100:.0f}¢ edge "
-                                        f"(bid {best_bid*100:.0f}¢ ask {ask_now*100:.0f}¢)"
-                                    )
-                                    await asyncio.sleep(LOOP_INTERVAL_SECONDS)
-                                    continue
-                                resting = await asyncio.to_thread(
-                                    live_exec.place_resting,
-                                    market_ticker=ticker,
-                                    window_id=window.window_id,
-                                    advice_side=advice.action,
-                                    share_price=rest_price,
-                                    rest_seconds=LIVE_REST_SECONDS,
-                                )
-                                live_attempts[window.window_id] = attempts + 1
-                                if resting is None:
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE rest rejected "
-                                        f"{advice.action} @{rest_price*100:.0f}¢ "
-                                        f"{ticker}{depth_note}"
+                                        f"orderbook to rest on for {ticker}"
                                     )
                                 else:
-                                    resting_advice = advice
-                                    resting_window = window
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE RESTING "
-                                        f"{advice.action} @{rest_price*100:.0f}¢ "
-                                        f"x{resting.contracts:g} {ticker} "
-                                        f"for {LIVE_REST_SECONDS:.0f}s "
-                                        f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
-                                        f"{depth_note}"
-                                    )
-                            else:
-                                bid_price = _limit_price_with_tolerance(
-                                    ask=ask_now, model_prob=model_now
-                                )
-                                live_plan = live_exec.execute(
-                                    live_exec.plan_order(
-                                        market_ticker=ticker,
-                                        advice_side=advice.action,  # type: ignore[arg-type]
-                                        share_price=bid_price,
-                                    )
-                                )
-                                live_attempts[window.window_id] = attempts + 1
-                                note = "ORDER" if live_plan.submitted else "DRY-RUN"
-                                pad = ""
-                                if bid_price > ask_now:
-                                    pad = (
-                                        f" (ask {ask_now*100:.0f}¢ "
-                                        f"+{(bid_price-ask_now)*100:.0f}¢)"
-                                    )
-                                print(
-                                    f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
-                                    f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
-                                    f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
-                                    f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS}){pad}{depth_note}"
-                                    + (f" err={live_plan.error}" if live_plan.error else "")
-                                )
-                                notifier.live_order_plan(live_plan, note=note)
-                                live_filled = bool(live_plan.submitted and live_plan.filled)
-                                if live_plan.submitted:
-                                    if live_filled:
-                                        live_fill_count += 1
+                                    # Prefer the advisor side when it already
+                                    # cleared ask-edge; otherwise try both legs
+                                    # for a bid we can join with real edge.
+                                    side_order: list[str] = []
+                                    if advice.should_bet:
+                                        side_order.append(advice.action)
+                                    for side in ("ABOVE", "BELOW"):
+                                        if side not in side_order:
+                                            side_order.append(side)
+                                    chosen: Optional[
+                                        tuple[str, float, float, float]
+                                    ] = None
+                                    for side in side_order:
+                                        model = float(
+                                            advice.prob_above
+                                            if side == "ABOVE"
+                                            else advice.prob_below
+                                        )
+                                        cand = _maker_rest_candidate(
+                                            side=side,
+                                            model_prob=model,
+                                            book=book_now,
+                                        )
+                                        if cand is None:
+                                            continue
+                                        rest_price, edge = cand
+                                        if chosen is None or edge > chosen[2]:
+                                            chosen = (side, rest_price, edge, model)
+                                    if chosen is None:
+                                        # Common — don't spam logs every tick.
+                                        note_skip("no maker price with edge")
                                     else:
-                                        live_miss_count += 1
-                                    total_orders = live_fill_count + live_miss_count
-                                    print(
-                                        f"[{_utcnow_label()}] LIVE fill rate "
-                                        f"{live_fill_count}/{total_orders} "
-                                        f"({live_fill_count / total_orders * 100:.0f}%)"
+                                        side, rest_price, edge, model_now = chosen
+                                        ask_now = book_now.ask_for(side)
+                                        bid_now = book_now.bid_for(side)
+                                        depth = book_now.depth_for(side)
+                                        depth_note = (
+                                            f" bid {bid_now*100:.0f}¢ ask "
+                                            f"{(ask_now or 0)*100:.0f}¢ "
+                                            f"x{depth:g} edge {edge*100:.1f}¢"
+                                        )
+                                        resting = await asyncio.to_thread(
+                                            live_exec.place_resting,
+                                            market_ticker=ticker,
+                                            window_id=window.window_id,
+                                            advice_side=side,
+                                            share_price=rest_price,
+                                            rest_seconds=LIVE_REST_SECONDS,
+                                        )
+                                        live_attempts[window.window_id] = attempts + 1
+                                        if resting is None:
+                                            print(
+                                                f"[{_utcnow_label()}] LIVE rest rejected "
+                                                f"{side} @{rest_price*100:.0f}¢ "
+                                                f"{ticker}{depth_note}"
+                                            )
+                                        else:
+                                            resting_advice = replace(
+                                                advice,
+                                                action=side,  # type: ignore[arg-type]
+                                                edge=edge,
+                                                reason=(
+                                                    f"maker rest {side} @"
+                                                    f"{rest_price*100:.1f}¢ "
+                                                    f"(edge {edge*100:.1f}¢)"
+                                                ),
+                                            )
+                                            resting_window = window
+                                            print(
+                                                f"[{_utcnow_label()}] LIVE RESTING "
+                                                f"{side} @{rest_price*100:.0f}¢ "
+                                                f"x{resting.contracts:g} {ticker} "
+                                                f"for {LIVE_REST_SECONDS:.0f}s "
+                                                f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
+                                                f"{depth_note}"
+                                            )
+                            elif advice.should_bet and advice.entry_share_price is not None:
+                                # Taker: cross the real ask (already preferred
+                                # in advice when orderbook-first is on).
+                                ask_now = float(advice.entry_share_price)
+                                model_now = float(
+                                    advice.prob_above
+                                    if advice.action == "ABOVE"
+                                    else advice.prob_below
+                                )
+                                send_order = True
+                                if book_now is not None:
+                                    true_ask = book_now.ask_for(advice.action)
+                                    fresh_edge = (
+                                        model_now - true_ask
+                                        if true_ask is not None
+                                        else None
                                     )
-                                if live_filled:
-                                    live_filled_windows.add(window.window_id)
+                                    if true_ask is None:
+                                        depth_note = " (book unreadable, using advice ask)"
+                                    elif fresh_edge is not None and fresh_edge < MIN_EDGE:
+                                        send_order = False
+                                        note_skip("edge gone on real book")
+                                        print(
+                                            f"[{_utcnow_label()}] LIVE skip — edge gone "
+                                            f"at real ask {true_ask*100:.0f}¢ "
+                                            f"(edge {fresh_edge*100:+.1f}¢)"
+                                        )
+                                    else:
+                                        depth = book_now.depth_for(advice.action)
+                                        depth_note = (
+                                            f" book {true_ask*100:.0f}¢ x{depth:g}"
+                                        )
+                                        ask_now = true_ask
+                                if send_order:
+                                    bid_price = _limit_price_with_tolerance(
+                                        ask=ask_now, model_prob=model_now
+                                    )
+                                    live_plan = live_exec.execute(
+                                        live_exec.plan_order(
+                                            market_ticker=ticker,
+                                            advice_side=advice.action,  # type: ignore[arg-type]
+                                            share_price=bid_price,
+                                        )
+                                    )
+                                    live_attempts[window.window_id] = attempts + 1
+                                    note = "ORDER" if live_plan.submitted else "DRY-RUN"
+                                    pad = ""
+                                    if bid_price > ask_now:
+                                        pad = (
+                                            f" (ask {ask_now*100:.0f}¢ "
+                                            f"+{(bid_price-ask_now)*100:.0f}¢)"
+                                        )
+                                    print(
+                                        f"[{_utcnow_label()}] LIVE {note} {live_plan.advice_side} "
+                                        f"{live_plan.book_side} @{live_plan.yes_book_price*100:.1f}¢ "
+                                        f"x{live_plan.contracts:.2f} {live_plan.market_ticker} "
+                                        f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS}){pad}{depth_note}"
+                                        + (f" err={live_plan.error}" if live_plan.error else "")
+                                    )
+                                    notifier.live_order_plan(live_plan, note=note)
+                                    live_filled = bool(
+                                        live_plan.submitted and live_plan.filled
+                                    )
+                                    if live_plan.submitted:
+                                        if live_filled:
+                                            live_fill_count += 1
+                                        else:
+                                            live_miss_count += 1
+                                        total_orders = live_fill_count + live_miss_count
+                                        print(
+                                            f"[{_utcnow_label()}] LIVE fill rate "
+                                            f"{live_fill_count}/{total_orders} "
+                                            f"({live_fill_count / total_orders * 100:.0f}%)"
+                                        )
+                                    if live_filled:
+                                        live_filled_windows.add(window.window_id)
                 # The book mirrors whatever actually happened: the paper
                 # assumption when papering, the real fill when live. Without
                 # this, live mode would track no W/L, P/L, settlement or vault.

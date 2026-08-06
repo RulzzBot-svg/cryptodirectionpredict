@@ -185,12 +185,19 @@ abandoned if it no longer clears `MIN_EDGE`.
 Orders are placed `LIVE_PRICE_TOLERANCE_CENTS` (default 1¢) above the ask
 so a single tick doesn't cost the trade.
 
+**Live pricing is orderbook-first.** Advice and orders use the real Kalshi
+book, not the softer market snapshot. That stops the old loop where paper/live
+saw an 8¢ edge, then skipped at submit (`edge gone on real book`) and barely
+filled.
+
 **Taker vs maker (`LIVE_ORDER_MODE`).** The default `taker` mode crosses the
 spread with an IOC order: it fills instantly or not at all, and pays the full
 `0.07 × C × P × (1−P)` fee. Setting `maker` instead rests a **post-only** limit
 order on the book for `LIVE_REST_SECONDS` (default 45) and lets the market come
-to it. That trades instant execution for a much longer window to get hit, at
-roughly a **quarter of the fee**.
+to it. Maker edge is measured versus the **rest price (bid)**, not the ask, so
+a wide ask no longer kills volume. Rest prices still respect `MIN_ENTRY_PRICE`
+(no more sub-floor maker fills). That trades instant execution for a much
+longer window to get hit, at roughly a **quarter of the fee**.
 
 The trade-off is adverse selection — a resting bid tends to get filled exactly
 when the price is moving against it. The short expiry limits how stale the
