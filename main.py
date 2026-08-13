@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from config.bet_blackout import load_bet_blackout
 from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.live_gate import (
     EARLIEST_LIVE_DATE,
@@ -87,6 +88,20 @@ CONTRACT_COST = float(os.getenv("CONTRACT_COST", "0.50"))  # legacy unused
 STAKE_NOTIONAL = float(os.getenv("STAKE_NOTIONAL", "5"))
 AUTO_BET = os.getenv("AUTO_BET", "true").strip().lower() in {"1", "true", "yes", "on"}
 MIN_SECONDS_TO_BET = float(os.getenv("MIN_SECONDS_TO_BET", "20"))
+# Skip new bets in a local-time window (live MAD autopsy: 02–06 UTC / 7–11 PM LA).
+# Settles and resting-fill polls still run; new orders and new rests do not.
+BET_BLACKOUT_ENABLED = os.getenv("BET_BLACKOUT_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+BET_BLACKOUT = load_bet_blackout(
+    enabled=BET_BLACKOUT_ENABLED,
+    tz_name=os.getenv("BET_BLACKOUT_TZ", "America/Los_Angeles"),
+    start_raw=os.getenv("BET_BLACKOUT_START", "19:00"),
+    end_raw=os.getenv("BET_BLACKOUT_END", "23:00"),
+)
 RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() in {
     "1",
     "true",
@@ -525,6 +540,7 @@ async def run_bot(
     else:
         print("  Paper vault     : OFF")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
+    print(f"  Bet blackout    : {BET_BLACKOUT.label()}")
     if LIVE_TRADING:
         print("  Live trading    : ARMED (real Kalshi orders)")
     elif LIVE_DRY_RUN:
@@ -677,6 +693,7 @@ async def run_bot(
     # Why the bot didn't bet, counted per window. Without this a bot that is
     # correctly declining every price looks identical to a frozen one.
     skip_counts: dict[str, int] = {}
+    last_blackout_window: Optional[str] = None
 
     def note_skip(reason: str) -> None:
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
@@ -1189,7 +1206,62 @@ async def run_bot(
                 and live_exec is not None
                 and LIVE_ORDER_MODE == "maker"
             )
-            if (
+            # Local-time blackout: cancel any resting quote and skip new bets.
+            # Open positions still settle normally.
+            if BET_BLACKOUT.active():
+                if resting is not None and live_exec is not None:
+                    late_fill = await asyncio.to_thread(
+                        live_exec.poll_resting, resting
+                    )
+                    if (
+                        late_fill is not None
+                        and resting_advice is not None
+                        and resting_window is not None
+                        and book.get_open_bet(resting.window_id) is None
+                    ):
+                        live_filled_windows.add(resting.window_id)
+                        live_fill_count += 1
+                        placed = book.place_bet(
+                            resting_window,
+                            resting_advice,
+                            contract_price=late_fill.price_paid,
+                            stake_notional=late_fill.contracts,
+                            price_includes_fees=True,
+                        )
+                        if placed is not None:
+                            notifier.bet_placed(
+                                placed, reason=resting_advice.reason
+                            )
+                            print(
+                                f"[{_utcnow_label()}] LIVE RESTING FILLED "
+                                f"before blackout cancel {resting.advice_side} "
+                                f"{late_fill.contracts:g} @ "
+                                f"{late_fill.price_paid*100:.1f}¢"
+                            )
+                    else:
+                        cancelled = await asyncio.to_thread(
+                            live_exec.cancel_resting, resting
+                        )
+                        if cancelled:
+                            print(
+                                f"[{_utcnow_label()}] LIVE cancelled resting "
+                                f"for bet blackout ({BET_BLACKOUT.label()})"
+                            )
+                    resting = None
+                    resting_advice = None
+                    resting_window = None
+                if AUTO_BET and (
+                    advice.should_bet or (can_live_maker and MAKER_ANY_SIDE)
+                ):
+                    note_skip("bet blackout")
+                    # One line per window so logs stay readable.
+                    if window.window_id != last_blackout_window:
+                        print(
+                            f"[{_utcnow_label()}] SKIP bets — blackout "
+                            f"{BET_BLACKOUT.label()}"
+                        )
+                        last_blackout_window = window.window_id
+            elif (
                 AUTO_BET
                 and resting is None
                 and book.get_open_bet(window.window_id) is None

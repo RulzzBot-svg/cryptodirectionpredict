@@ -221,6 +221,13 @@ On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 `.key` file on the disk) as secrets — never commit them. Do **not** flip
 `LIVE_TRADING` on the paper worker yet.
 
+**Evening blackout (`BET_BLACKOUT_*`).** Live MAD showed a recurring knife in
+the **7:00–11:00 PM America/Los_Angeles** window (02:00–06:00 UTC). With the
+default blackout enabled, the bot still prices and settles, but it will not
+place new paper/live orders (and it cancels any resting maker quote) inside
+that local-time range. Set `BET_BLACKOUT_ENABLED=false` to disable, or change
+`BET_BLACKOUT_START` / `END` / `TZ`.
+
 ### Useful env vars
 
 | Variable | Default | Meaning |
@@ -241,6 +248,9 @@ On Render, store `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_PEM` (or mount the
 | `VAULT_GOAL` | `300` | Stop auto-vault once put aside reaches this |
 | `CONTRACT_COST` | `0.50` | Legacy; ignored when using notional stake sizing |
 | `AUTO_BET` | `true` | Place paper bets automatically |
+| `BET_BLACKOUT_ENABLED` | `true` | Skip new bets in a local-time window |
+| `BET_BLACKOUT_TZ` | `America/Los_Angeles` | IANA timezone for the blackout |
+| `BET_BLACKOUT_START` / `END` | `19:00` / `23:00` | Half-open local window (7–11 PM LA) |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |
