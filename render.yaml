@@ -1,0 +1,62 @@
+# Render Blueprint (optional). You can also create the Background Worker in the UI.
+services:
+  - type: worker
+    name: btc-15m-paper-bot
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: cursor/live-release-1b7a
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash scripts/start_render.sh
+    autoDeploy: true
+    disk:
+      name: paper-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: DATA_DIR
+        value: /var/data
+      - key: BACKUP_KEEP
+        value: "6"
+      - key: LOG_MAX_BYTES
+        value: "2097152"
+      - key: LOG_BACKUP_COUNT
+        value: "2"
+      - key: PAPER_INITIAL_BALANCE
+        value: "100"
+      - key: STAKE_NOTIONAL
+        value: "5"
+      - key: VAULT_ENABLED
+        value: "true"
+      - key: VAULT_TRIGGER_PROFIT
+        value: "55"
+      - key: VAULT_WITHDRAW_AMOUNT
+        value: "50"
+      - key: VAULT_GOAL
+        value: "300"
+      - key: AUTO_BET
+        value: "true"
+      - key: MIN_EDGE
+        value: "0.08"
+      - key: STRIKE_SOURCE
+        value: kalshi
+      - key: KALSHI_SERIES
+        value: KXBTC15M
+      - key: SYMBOL
+        value: BTC/USD
+      - key: DATA_PROVIDER
+        value: coinbase
+      - key: TELEGRAM_ALERTS
+        value: "true"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      # Never flip this to "true" on a running service — it wipes the bank.
+      - key: RESET_PAPER_HISTORY
+        value: "false"
+      # Live trading is additionally hard-gated in code (date + confirm phrase).
+      - key: LIVE_TRADING
+        value: "false"

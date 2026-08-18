@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -12,6 +13,28 @@ import pandas as pd
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def haircut_factor() -> float:
+    """How far to trust the raw model. 1.0 = no haircut; 0.55 ≈ live MAD honesty."""
+    raw = os.getenv("PROB_HAIRCUT", "0.55").strip()
+    try:
+        factor = float(raw)
+    except ValueError:
+        factor = 0.55
+    return min(1.0, max(0.0, factor))
+
+
+def apply_prob_haircut(p: float, factor: Optional[float] = None) -> float:
+    """Shrink a probability toward 50¢.
+
+    Live MAD claimed ~78% and delivered ~67%. A factor of 0.55 maps 78% → 65%,
+    so MIN_EDGE sees honest cents instead of fake +12¢. Set PROB_HAIRCUT=1 to
+    disable. Does not learn online — one knob, slow to change.
+    """
+    scale = haircut_factor() if factor is None else min(1.0, max(0.0, float(factor)))
+    p = min(1.0, max(0.0, float(p)))
+    return 0.5 + (p - 0.5) * scale
 
 
 @dataclass(frozen=True)
@@ -35,17 +58,40 @@ class ProbabilityEstimate:
         return self.prob_below * 100.0
 
 
+def _scale_from_returns(log_returns: pd.Series, estimator: str) -> float:
+    """Width of a return distribution, by one of two definitions.
+
+    ``std`` is the textbook choice but is dominated by rare large moves. Whether
+    price crosses a strike a short distance away is decided by ordinary windows,
+    not violent ones, so ``mad`` measures the middle of the distribution instead
+    (scaled to match std for a true normal). For BTC's peaked, jump-prone
+    15-minute returns the two differ by well over 50%, and using std makes every
+    probability sit too close to a coin flip.
+    """
+    if estimator == "std":
+        return float(log_returns.std(ddof=1))
+    median = float(log_returns.median())
+    mad = float((log_returns - median).abs().median())
+    return 1.4826 * mad
+
+
 def realized_vol_per_sqrt_second(
     candles: pd.DataFrame,
     *,
     min_bars: int = 20,
     fallback_annual_vol: float = 0.60,
+    estimator: Optional[str] = None,
 ) -> float:
     """
     Estimate σ such that variance over ``t`` seconds ≈ (σ_per_sqrt_second ** 2) * t.
 
     Uses log-returns of candle closes and scales by median bar duration.
     """
+    estimator = (
+        estimator if estimator is not None else os.getenv("VOL_ESTIMATOR", "std")
+    ).strip().lower()
+    if estimator not in {"std", "mad"}:
+        estimator = "std"
     seconds_per_year = 365.25 * 24 * 3600
     fallback = fallback_annual_vol / math.sqrt(seconds_per_year)
 
@@ -69,7 +115,7 @@ def realized_vol_per_sqrt_second(
             if median > 0:
                 bar_seconds = median
 
-    sigma_bar = float(log_returns.tail(100).std(ddof=1))
+    sigma_bar = _scale_from_returns(log_returns.tail(100), estimator)
     if not math.isfinite(sigma_bar) or sigma_bar <= 0:
         return fallback
 
@@ -102,6 +148,43 @@ def estimate_prob_above(
     tau = max(float(seconds_remaining), 0.0)
     distance_pct = (spot - strike) / strike * 100.0
 
+    # BTC's 15m returns are far from normal (excess kurtosis ~+16), so no single
+    # sigma describes both the peak and the jumps. When asked, and when there's
+    # enough history, use the shape of past returns directly instead.
+    model = os.getenv("PROB_MODEL", "lognormal").strip().lower()
+    if model == "empirical" and candles is not None and sigma_per_sqrt_second is None:
+        from prediction.empirical import fit_returns, prob_above_empirical
+
+        fit = fit_returns(candles)
+        if fit is not None:
+            p_above = apply_prob_haircut(
+                prob_above_empirical(
+                    spot=spot, strike=strike, seconds_remaining=tau, fit=fit
+                )
+            )
+            p_below = 1.0 - p_above
+            seconds_per_year = 365.25 * 24 * 3600
+            # Report the distribution's own robust width so the status line and
+            # diagnostics stay comparable across models.
+            sigma_report = fit.scale_15m / math.sqrt(15 * 60) if fit.scale_15m else sigma
+            return ProbabilityEstimate(
+                spot=float(spot),
+                strike=float(strike),
+                seconds_remaining=tau,
+                sigma_per_sqrt_second=sigma_report,
+                annualized_vol=sigma_report * math.sqrt(seconds_per_year),
+                prob_above=p_above,
+                prob_below=p_below,
+                distance_pct=distance_pct,
+                moneyness=(
+                    "ITM_ABOVE"
+                    if spot > strike * 1.0005
+                    else "ITM_BELOW"
+                    if spot < strike * 0.9995
+                    else "ATM"
+                ),
+            )
+
     if tau <= 1e-9:
         if spot > strike:
             p_above = 1.0
@@ -114,7 +197,7 @@ def estimate_prob_above(
         d2 = (math.log(spot / strike) - 0.5 * (sigma**2) * tau) / vol_term
         p_above = _norm_cdf(d2)
 
-    p_above = min(1.0, max(0.0, float(p_above)))
+    p_above = apply_prob_haircut(min(1.0, max(0.0, float(p_above))))
     p_below = 1.0 - p_above
 
     if spot > strike * 1.0005:

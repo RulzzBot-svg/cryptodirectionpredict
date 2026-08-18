@@ -50,6 +50,7 @@ def init_db(engine=None) -> None:
     eng = engine or create_db_engine()
     Base.metadata.create_all(eng)
     _migrate_sqlite_prediction_bets(eng)
+    _migrate_sqlite_prediction_bankroll(eng)
 
 
 def _migrate_sqlite_prediction_bets(engine) -> None:
@@ -76,6 +77,27 @@ def _migrate_sqlite_prediction_bets(engine) -> None:
                 text(
                     "ALTER TABLE prediction_bets "
                     "ADD COLUMN contract_price FLOAT NOT NULL DEFAULT 0.50"
+                )
+            )
+
+
+def _migrate_sqlite_prediction_bankroll(engine) -> None:
+    """Add vaulted_usd to existing SQLite bankroll rows."""
+    url = str(engine.url)
+    if not url.startswith("sqlite"):
+        return
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(prediction_bankroll)")).fetchall()
+        if not rows:
+            return
+        names = {row[1] for row in rows}
+        if "vaulted_usd" not in names:
+            conn.execute(
+                text(
+                    "ALTER TABLE prediction_bankroll "
+                    "ADD COLUMN vaulted_usd FLOAT NOT NULL DEFAULT 0.0"
                 )
             )
 

@@ -4,6 +4,12 @@
 venv/
 env/
 
+# Kalshi API private keys (never commit)
+*.key
+*.pem
+secrets/
+.kalshi/
+
 # Python
 __pycache__/
 *.py[cod]
