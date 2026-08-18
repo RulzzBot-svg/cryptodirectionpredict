@@ -228,6 +228,24 @@ place new paper/live orders (and it cancels any resting maker quote) inside
 that local-time range. Set `BET_BLACKOUT_ENABLED=false` to disable, or change
 `BET_BLACKOUT_START` / `END` / `TZ`.
 
+**Run it without watching Render.** Keep `AUTO_BET=true` and `LIVE_TRADING=false`
+until you explicitly arm live. Three automatic brakes then sit on top of the
+edge filter:
+
+1. **Evening blackout** — no new bets 7–11 PM America/Los_Angeles.
+2. **Probability haircut (`PROB_HAIRCUT`, default 0.55)** — live MAD claimed
+   ~78% and delivered ~67%. The haircut shrinks every probability toward 50¢
+   (`p' = 0.5 + (p − 0.5) × 0.55`) so an 8¢ `MIN_EDGE` is real cents, not fake
+   +12¢. Set `PROB_HAIRCUT=1` to disable. This is **not** online learning.
+3. **Auto halt (`BET_HALT_*`)** — skip new bets (and cancel resting makers) for
+   the rest of the local day after a **−$15** day or **≤56% WR on ≥25 bets**,
+   and while cash **≤ $30**. Day halts lift at local midnight; the bank floor
+   lifts when cash recovers. Telegram fires once when a halt starts.
+
+Do **not** flip `LIVE_TRADING` on just because paper is automatic. Haircut +
+halt + blackout are what make unattended paper safe-enough; live still needs a
+human env change after a clean paper stretch.
+
 ### Useful env vars
 
 | Variable | Default | Meaning |
@@ -251,6 +269,11 @@ that local-time range. Set `BET_BLACKOUT_ENABLED=false` to disable, or change
 | `BET_BLACKOUT_ENABLED` | `true` | Skip new bets in a local-time window |
 | `BET_BLACKOUT_TZ` | `America/Los_Angeles` | IANA timezone for the blackout |
 | `BET_BLACKOUT_START` / `END` | `19:00` / `23:00` | Half-open local window (7–11 PM LA) |
+| `PROB_HAIRCUT` | `0.55` | Shrink model probs toward 50¢ (`1` = raw model) |
+| `BET_HALT_ENABLED` | `true` | Auto-skip new bets on a kill day / bank floor |
+| `BET_HALT_BANK_FLOOR` | `30` | No new bets while cash ≤ this |
+| `BET_HALT_DAY_LOSS` | `15` | Halt rest of local day after −$15 |
+| `BET_HALT_DAY_MIN_BETS` / `DAY_MAX_WR` | `25` / `0.56` | Halt rest of day if WR ≤56% on ≥25 bets |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |

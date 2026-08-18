@@ -15,6 +15,28 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def haircut_factor() -> float:
+    """How far to trust the raw model. 1.0 = no haircut; 0.55 ≈ live MAD honesty."""
+    raw = os.getenv("PROB_HAIRCUT", "0.55").strip()
+    try:
+        factor = float(raw)
+    except ValueError:
+        factor = 0.55
+    return min(1.0, max(0.0, factor))
+
+
+def apply_prob_haircut(p: float, factor: Optional[float] = None) -> float:
+    """Shrink a probability toward 50¢.
+
+    Live MAD claimed ~78% and delivered ~67%. A factor of 0.55 maps 78% → 65%,
+    so MIN_EDGE sees honest cents instead of fake +12¢. Set PROB_HAIRCUT=1 to
+    disable. Does not learn online — one knob, slow to change.
+    """
+    scale = haircut_factor() if factor is None else min(1.0, max(0.0, float(factor)))
+    p = min(1.0, max(0.0, float(p)))
+    return 0.5 + (p - 0.5) * scale
+
+
 @dataclass(frozen=True)
 class ProbabilityEstimate:
     spot: float
@@ -135,8 +157,10 @@ def estimate_prob_above(
 
         fit = fit_returns(candles)
         if fit is not None:
-            p_above = prob_above_empirical(
-                spot=spot, strike=strike, seconds_remaining=tau, fit=fit
+            p_above = apply_prob_haircut(
+                prob_above_empirical(
+                    spot=spot, strike=strike, seconds_remaining=tau, fit=fit
+                )
             )
             p_below = 1.0 - p_above
             seconds_per_year = 365.25 * 24 * 3600
@@ -173,7 +197,7 @@ def estimate_prob_above(
         d2 = (math.log(spot / strike) - 0.5 * (sigma**2) * tau) / vol_term
         p_above = _norm_cdf(d2)
 
-    p_above = min(1.0, max(0.0, float(p_above)))
+    p_above = apply_prob_haircut(min(1.0, max(0.0, float(p_above))))
     p_below = 1.0 - p_above
 
     if spot > strike * 1.0005:

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import load_settings
 from config.kalshi_fees import order_fee
+from config.auto_halt import RiskSnapshot, snapshot_from_rows
 from models.db import create_db_engine, create_session_factory, init_db
 from models.prediction import PredictionBankroll, PredictionBet
 from prediction.advisor import Advice
@@ -138,6 +139,19 @@ class PredictionBook:
     def get_balance(self) -> float:
         with self.session_factory() as session:
             return float(self._get_bankroll(session).usd_balance)
+
+    def risk_snapshot(self, *, tz_name: str = "America/Los_Angeles") -> RiskSnapshot:
+        """Settled P/L for the current local day + cash bank. Read-only."""
+        with self.session_factory() as session:
+            bank = float(self._get_bankroll(session).usd_balance)
+            rows = session.execute(
+                select(
+                    PredictionBet.pnl,
+                    PredictionBet.settled_at,
+                    PredictionBet.status,
+                ).where(PredictionBet.status.in_(("WON", "LOST")))
+            ).all()
+        return snapshot_from_rows(bank=bank, rows=list(rows), tz_name=tz_name)
 
     def set_bank(self, amount: float, *, reason: str = "reconciled") -> float:
         """Force the cash balance to a known figure, keeping all bet history.

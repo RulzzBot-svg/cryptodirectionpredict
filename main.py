@@ -32,6 +32,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from config.bet_blackout import load_bet_blackout
+from config.auto_halt import load_auto_halt
 from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.live_gate import (
     EARLIEST_LIVE_DATE,
@@ -57,6 +58,7 @@ from execution.prediction_book import PredictionBook
 from models.db import create_db_engine, create_session_factory, init_db
 from notifications import TelegramNotifier
 from prediction.advisor import PredictionAdvisor
+from prediction.probability import haircut_factor
 from prediction.window import WindowManager
 
 load_dotenv()
@@ -101,6 +103,22 @@ BET_BLACKOUT = load_bet_blackout(
     tz_name=os.getenv("BET_BLACKOUT_TZ", "America/Los_Angeles"),
     start_raw=os.getenv("BET_BLACKOUT_START", "19:00"),
     end_raw=os.getenv("BET_BLACKOUT_END", "23:00"),
+)
+# Leave AUTO_BET on: these halt new bets without anyone watching Render.
+# Day rules reset at local midnight; bank floor clears when cash recovers.
+BET_HALT_ENABLED = os.getenv("BET_HALT_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+AUTO_HALT = load_auto_halt(
+    enabled=BET_HALT_ENABLED,
+    tz_name=os.getenv("BET_HALT_TZ", os.getenv("BET_BLACKOUT_TZ", "America/Los_Angeles")),
+    bank_floor=float(os.getenv("BET_HALT_BANK_FLOOR", "30")),
+    day_loss=float(os.getenv("BET_HALT_DAY_LOSS", "15")),
+    day_min_bets=int(float(os.getenv("BET_HALT_DAY_MIN_BETS", "25"))),
+    day_max_wr=float(os.getenv("BET_HALT_DAY_MAX_WR", "0.56")),
 )
 RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() in {
     "1",
@@ -506,7 +524,8 @@ async def run_bot(
     )
     print(
         f"  Probability     : {os.getenv('PROB_MODEL', 'lognormal')} "
-        f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars)"
+        f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars, "
+        f"haircut {haircut_factor():.2f})"
     )
     print(f"  Strike source   : {'kalshi' if use_kalshi else 'manual/auto'}")
     if market_locked:
@@ -541,6 +560,7 @@ async def run_bot(
         print("  Paper vault     : OFF")
     print(f"  Auto-bet        : {'ON' if AUTO_BET else 'OFF (advice only)'}")
     print(f"  Bet blackout    : {BET_BLACKOUT.label()}")
+    print(f"  Auto halt       : {AUTO_HALT.label()}")
     if LIVE_TRADING:
         print("  Live trading    : ARMED (real Kalshi orders)")
     elif LIVE_DRY_RUN:
@@ -588,6 +608,18 @@ async def run_bot(
         engine=engine,
         fee_mode=_advisor_fee_mode(),
     )
+    try:
+        halt_now = AUTO_HALT.evaluate(
+            book.risk_snapshot(tz_name=AUTO_HALT.tz_name)
+        )
+        if halt_now is not None:
+            print(
+                f"[{_utcnow_label()}] AUTO HALT already on — {halt_now.detail}. "
+                "No new bets until it clears."
+            )
+            notifier.info(f"AUTO HALT — {halt_now.detail}. No new bets until it clears.")
+    except Exception as exc:
+        print(f"[{_utcnow_label()}] Auto-halt snapshot failed: {exc}")
 
     if LIVE_TRADING:
         notifier.prefix = "LIVE"
@@ -693,7 +725,8 @@ async def run_bot(
     # Why the bot didn't bet, counted per window. Without this a bot that is
     # correctly declining every price looks identical to a frozen one.
     skip_counts: dict[str, int] = {}
-    last_blackout_window: Optional[str] = None
+    last_block_window: Optional[str] = None
+    last_halt_alert: Optional[str] = None
 
     def note_skip(reason: str) -> None:
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
@@ -1206,9 +1239,21 @@ async def run_bot(
                 and live_exec is not None
                 and LIVE_ORDER_MODE == "maker"
             )
-            # Local-time blackout: cancel any resting quote and skip new bets.
-            # Open positions still settle normally.
-            if BET_BLACKOUT.active():
+            # Scheduled blackout + auto halt: cancel resting quotes and skip
+            # new bets. Open positions still settle normally.
+            halt = AUTO_HALT.evaluate(
+                book.risk_snapshot(tz_name=AUTO_HALT.tz_name)
+            )
+            if halt is None:
+                last_halt_alert = None
+            in_blackout = BET_BLACKOUT.active()
+            block_new = in_blackout or halt is not None
+            if block_new:
+                block_why = (
+                    f"bet blackout ({BET_BLACKOUT.label()})"
+                    if in_blackout
+                    else f"auto halt ({halt.reason})"
+                )
                 if resting is not None and live_exec is not None:
                     late_fill = await asyncio.to_thread(
                         live_exec.poll_resting, resting
@@ -1234,7 +1279,7 @@ async def run_bot(
                             )
                             print(
                                 f"[{_utcnow_label()}] LIVE RESTING FILLED "
-                                f"before blackout cancel {resting.advice_side} "
+                                f"before {block_why} cancel {resting.advice_side} "
                                 f"{late_fill.contracts:g} @ "
                                 f"{late_fill.price_paid*100:.1f}¢"
                             )
@@ -1245,7 +1290,7 @@ async def run_bot(
                         if cancelled:
                             print(
                                 f"[{_utcnow_label()}] LIVE cancelled resting "
-                                f"for bet blackout ({BET_BLACKOUT.label()})"
+                                f"for {block_why}"
                             )
                     resting = None
                     resting_advice = None
@@ -1253,14 +1298,29 @@ async def run_bot(
                 if AUTO_BET and (
                     advice.should_bet or (can_live_maker and MAKER_ANY_SIDE)
                 ):
-                    note_skip("bet blackout")
+                    note_skip(
+                        "bet blackout" if in_blackout else f"auto halt ({halt.reason})"
+                    )
                     # One line per window so logs stay readable.
-                    if window.window_id != last_blackout_window:
-                        print(
-                            f"[{_utcnow_label()}] SKIP bets — blackout "
-                            f"{BET_BLACKOUT.label()}"
-                        )
-                        last_blackout_window = window.window_id
+                    if window.window_id != last_block_window:
+                        if in_blackout:
+                            print(
+                                f"[{_utcnow_label()}] SKIP bets — blackout "
+                                f"{BET_BLACKOUT.label()}"
+                            )
+                        else:
+                            print(
+                                f"[{_utcnow_label()}] SKIP bets — auto halt: "
+                                f"{halt.detail}"
+                            )
+                            if halt.reason != last_halt_alert:
+                                notifier.info(
+                                    f"AUTO HALT — {halt.detail}. No new bets; "
+                                    "resumes next LA morning (or when bank "
+                                    "is above the floor)."
+                                )
+                                last_halt_alert = halt.reason
+                        last_block_window = window.window_id
             elif (
                 AUTO_BET
                 and resting is None
