@@ -29,6 +29,8 @@ class TelegramNotifier:
             flag = os.getenv("TELEGRAM_ALERTS", "true").strip().lower()
             enabled = flag in {"1", "true", "yes", "on"}
         self.enabled = bool(enabled) and bool(self.token) and bool(self.chat_id)
+        quiet_flag = os.getenv("TELEGRAM_QUIET", "true").strip().lower()
+        self.quiet = quiet_flag in {"1", "true", "yes", "on"}
         # Set to "LIVE" once real orders are armed so alerts are unmistakable
         self.prefix = ""
         if enabled and not self.enabled:
@@ -72,6 +74,8 @@ class TelegramNotifier:
             return False
 
     def bet_placed(self, bet: Any, *, reason: str = "") -> None:
+        if self.quiet:
+            return
         px = float(bet.contract_price) * 100
         cost = float(bet.contract_cost)
         payout = float(bet.payout)
@@ -89,6 +93,8 @@ class TelegramNotifier:
         self.send(msg)
 
     def bet_settled(self, bet: Any) -> None:
+        if self.quiet:
+            return
         pnl = float(bet.pnl or 0.0)
         sign = "+" if pnl >= 0 else "-"
         msg = (
@@ -100,6 +106,8 @@ class TelegramNotifier:
         self.send(msg)
 
     def window_stats(self, stats: dict[str, Any], *, skips: str = "") -> None:
+        if self.quiet:
+            return
         pnl = float(stats.get("total_pnl") or 0.0)
         sign = "+" if pnl >= 0 else "-"
         vaulted = float(stats.get("vaulted_usd") or 0.0)
@@ -154,11 +162,18 @@ class TelegramNotifier:
             msg += f"\nERROR: {plan.error}"
         self.send(msg)
 
-    def info(self, text: str) -> None:
+    def info(self, text: str, *, important: bool = False) -> None:
+        if self.quiet and not important:
+            return
+        self.send(text)
+
+    def daily_digest(self, text: str) -> None:
         self.send(text)
 
     def previous_run_recap(self) -> None:
         """Send a fixed recap of the pre-restart paper run (cloud wipe)."""
+        if self.quiet:
+            return
         self.send(
             "PREVIOUS RUN RECAP (before cloud wipe / restart)\n"
             "----------------------------------------------\n"

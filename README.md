@@ -241,6 +241,10 @@ edge filter:
    the rest of the local day after a **−$15** day or **≤56% WR on ≥25 bets**,
    and while cash **≤ $30**. Day halts lift at local midnight; the bank floor
    lifts when cash recovers. Telegram fires once when a halt starts.
+4. **Daily Telegram digest (`DIGEST_HOUR=7` LA)** — one scorecard (bank, FULL,
+   SINCE_HAIRCUT, TODAY, LAST50, halt, stay-paper vs sample-OK). Default
+   `TELEGRAM_QUIET=true` turns off per-bet spam so you only see this plus
+   halt/vault. Not an LLM predictor — 15m BTC does not need one.
 
 Do **not** flip `LIVE_TRADING` on just because paper is automatic. Haircut +
 halt + blackout are what make unattended paper safe-enough; live still needs a
@@ -274,6 +278,9 @@ human env change after a clean paper stretch.
 | `BET_HALT_BANK_FLOOR` | `30` | No new bets while cash ≤ this |
 | `BET_HALT_DAY_LOSS` | `15` | Halt rest of local day after −$15 |
 | `BET_HALT_DAY_MIN_BETS` / `DAY_MAX_WR` | `25` / `0.56` | Halt rest of day if WR ≤56% on ≥25 bets |
+| `DIGEST_HOUR` | `7` | Local hour to send the daily Telegram scorecard |
+| `HAIRCUT_SINCE` | `2026-08-18 17:52:00` | Start of the post-haircut sample in the digest |
+| `TELEGRAM_QUIET` | `true` | Skip per-bet/heartbeat spam; keep digest + halts + vault |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |

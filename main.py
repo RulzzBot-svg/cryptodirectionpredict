@@ -55,6 +55,14 @@ from data.price_tape import PriceTape
 from config.kalshi_fees import net_edge
 from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
 from execution.prediction_book import PredictionBook
+from execution.digest import (
+    digest_due,
+    digest_stamp_path,
+    format_digest,
+    load_digest,
+    read_stamp,
+    write_stamp,
+)
 from models.db import create_db_engine, create_session_factory, init_db
 from notifications import TelegramNotifier
 from prediction.advisor import PredictionAdvisor
@@ -128,8 +136,22 @@ RESET_PAPER_HISTORY = os.getenv("RESET_PAPER_HISTORY", "false").strip().lower() 
 }
 BACKUP_EVERY_SECONDS = float(os.getenv("BACKUP_EVERY_SECONDS", "300"))
 CALIBRATION_EVERY_SECONDS = float(os.getenv("CALIBRATION_EVERY_SECONDS", "60"))
-# Telegram "still alive" ping (0 disables)
+# Telegram "still alive" ping (0 disables). Quiet mode skips these.
 HEARTBEAT_EVERY_SECONDS = float(os.getenv("HEARTBEAT_EVERY_SECONDS", "900"))
+# One scorecard per local morning so you don't need Render or this chat.
+DIGEST_HOUR = int(float(os.getenv("DIGEST_HOUR", "7")))
+HAIRCUT_SINCE_RAW = os.getenv("HAIRCUT_SINCE", "2026-08-18 17:52:00").strip()
+
+
+def _haircut_since() -> datetime:
+    text = HAIRCUT_SINCE_RAW.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        dt = datetime(2026, 8, 18, 17, 52, tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 # kalshi (default) | manual | auto
 STRIKE_SOURCE = os.getenv("STRIKE_SOURCE", "kalshi").strip().lower()
 KALSHI_SERIES = os.getenv("KALSHI_SERIES", "KXBTC15M")
@@ -572,7 +594,11 @@ async def run_bot(
         print(
             f"  Live trading    : OFF (earliest unlock {EARLIEST_LIVE_DATE.isoformat()})"
         )
-    print(f"  Telegram alerts : {'ON' if notifier.active else 'OFF (set token/chat id)'}")
+    print(
+        f"  Telegram alerts : {'ON' if notifier.active else 'OFF (set token/chat id)'}"
+        f"{' (quiet — daily digest + halts only)' if notifier.active and notifier.quiet else ''}"
+        f" | digest {DIGEST_HOUR:02d}:00 {AUTO_HALT.tz_name}"
+    )
     if initial_strike:
         print(f"  Manual strike   : ${initial_strike:,.2f}")
     else:
@@ -617,7 +643,10 @@ async def run_bot(
                 f"[{_utcnow_label()}] AUTO HALT already on — {halt_now.detail}. "
                 "No new bets until it clears."
             )
-            notifier.info(f"AUTO HALT — {halt_now.detail}. No new bets until it clears.")
+            notifier.info(
+                f"AUTO HALT — {halt_now.detail}. No new bets until it clears.",
+                important=True,
+            )
     except Exception as exc:
         print(f"[{_utcnow_label()}] Auto-halt snapshot failed: {exc}")
 
@@ -695,7 +724,8 @@ async def run_bot(
             f"NEW RUN STARTED | bank ${stats0['usd_balance']:,.2f} | "
             f"aside ${float(stats0.get('vaulted_usd') or 0):,.2f} | "
             f"{stats0['win_count']}W/{stats0['loss_count']}L | "
-            f"face ${STAKE_NOTIONAL:g} | {vault_txt} | series {KALSHI_SERIES}"
+            f"face ${STAKE_NOTIONAL:g} | {vault_txt} | series {KALSHI_SERIES}",
+            important=True,
         )
 
     tape: Optional[PriceTape] = None
@@ -1317,7 +1347,8 @@ async def run_bot(
                                 notifier.info(
                                     f"AUTO HALT — {halt.detail}. No new bets; "
                                     "resumes next LA morning (or when bank "
-                                    "is above the floor)."
+                                    "is above the floor).",
+                                    important=True,
                                 )
                                 last_halt_alert = halt.reason
                         last_block_window = window.window_id
@@ -1641,6 +1672,34 @@ async def run_bot(
                 backup_now(database_url=settings.database_url)
                 last_backup_at = now_ts
 
+            if notifier.active:
+                stamp = digest_stamp_path(settings.database_url)
+                if digest_due(
+                    tz_name=AUTO_HALT.tz_name,
+                    hour=DIGEST_HOUR,
+                    last_sent=read_stamp(stamp),
+                ):
+                    try:
+                        halt_now = AUTO_HALT.evaluate(
+                            book.risk_snapshot(tz_name=AUTO_HALT.tz_name)
+                        )
+                        digest = load_digest(
+                            book.session_factory,
+                            tz_name=AUTO_HALT.tz_name,
+                            haircut_since=_haircut_since(),
+                            live=LIVE_TRADING,
+                            auto_bet=AUTO_BET,
+                            haircut=haircut_factor(),
+                            halt_detail=None if halt_now is None else halt_now.detail,
+                            blackout_label=BET_BLACKOUT.label(),
+                        )
+                        text = format_digest(digest)
+                        print(f"[{_utcnow_label()}] {text.replace(chr(10), ' | ')}")
+                        notifier.daily_digest(text)
+                        write_stamp(stamp, digest.local_day)
+                    except Exception as exc:  # noqa: BLE001 — digest must not kill the loop
+                        logger.warning("Daily digest failed: %s", exc)
+
             if (
                 notifier.active
                 and HEARTBEAT_EVERY_SECONDS > 0
@@ -1672,7 +1731,8 @@ async def run_bot(
                                 f"BOOK DRIFT ${drift:+,.2f} — bank "
                                 f"${stats_hb['usd_balance']:,.2f} vs Kalshi "
                                 f"${balance:,.2f}. Kalshi is correct; the book is "
-                                "recording outcomes that don't match."
+                                "recording outcomes that don't match.",
+                                important=True,
                             )
                     except KalshiAuthError as exc:
                         logger.warning("Heartbeat balance check failed: %s", exc)
