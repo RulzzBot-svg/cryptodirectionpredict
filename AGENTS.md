@@ -25,3 +25,7 @@ from prediction import WindowManager, PredictionAdvisor
 print('prediction package ok')
 PY
 ```
+
+## Weather Kalshi bot
+
+Moved to https://github.com/RulzzBot-svg/weatherpredict (separate repo).
