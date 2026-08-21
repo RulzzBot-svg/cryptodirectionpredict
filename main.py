@@ -761,6 +761,43 @@ async def run_bot(
     def note_skip(reason: str) -> None:
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
 
+    def maybe_send_daily_digest() -> None:
+        """One Telegram scorecard per local morning. Do not mark sent unless Telegram ack'd."""
+        if not notifier.active:
+            return
+        stamp = digest_stamp_path(settings.database_url)
+        if not digest_due(
+            tz_name=AUTO_HALT.tz_name,
+            hour=DIGEST_HOUR,
+            last_sent=read_stamp(stamp),
+        ):
+            return
+        try:
+            halt_now = AUTO_HALT.evaluate(
+                book.risk_snapshot(tz_name=AUTO_HALT.tz_name)
+            )
+            digest = load_digest(
+                book.session_factory,
+                tz_name=AUTO_HALT.tz_name,
+                haircut_since=_haircut_since(),
+                live=LIVE_TRADING,
+                auto_bet=AUTO_BET,
+                haircut=haircut_factor(),
+                halt_detail=None if halt_now is None else halt_now.detail,
+                blackout_label=BET_BLACKOUT.label(),
+            )
+            text = format_digest(digest)
+            print(f"[{_utcnow_label()}] {text.replace(chr(10), ' | ')}")
+            sent = notifier.daily_digest(text)
+            if sent:
+                write_stamp(stamp, digest.local_day)
+            else:
+                logger.warning(
+                    "Daily digest Telegram send failed — will retry next loop"
+                )
+        except Exception as exc:  # noqa: BLE001 — digest must not kill the loop
+            logger.warning("Daily digest failed: %s", exc)
+
     # Windows whose outcome Kalshi hasn't published yet: (window, ticker, closed_at)
     pending_settlements: list[tuple[Any, str, float]] = []
 
@@ -844,6 +881,7 @@ async def run_bot(
                     await close_exchange(exchange)
                     exchange = create_rest_exchange(provider)
                     consecutive_errors = 0
+                maybe_send_daily_digest()
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
 
@@ -857,6 +895,7 @@ async def run_bot(
                     price = streamed
                     spot_source = tape.transport
             if price <= 0:
+                maybe_send_daily_digest()
                 await asyncio.sleep(LOOP_INTERVAL_SECONDS)
                 continue
 
@@ -1672,33 +1711,7 @@ async def run_bot(
                 backup_now(database_url=settings.database_url)
                 last_backup_at = now_ts
 
-            if notifier.active:
-                stamp = digest_stamp_path(settings.database_url)
-                if digest_due(
-                    tz_name=AUTO_HALT.tz_name,
-                    hour=DIGEST_HOUR,
-                    last_sent=read_stamp(stamp),
-                ):
-                    try:
-                        halt_now = AUTO_HALT.evaluate(
-                            book.risk_snapshot(tz_name=AUTO_HALT.tz_name)
-                        )
-                        digest = load_digest(
-                            book.session_factory,
-                            tz_name=AUTO_HALT.tz_name,
-                            haircut_since=_haircut_since(),
-                            live=LIVE_TRADING,
-                            auto_bet=AUTO_BET,
-                            haircut=haircut_factor(),
-                            halt_detail=None if halt_now is None else halt_now.detail,
-                            blackout_label=BET_BLACKOUT.label(),
-                        )
-                        text = format_digest(digest)
-                        print(f"[{_utcnow_label()}] {text.replace(chr(10), ' | ')}")
-                        notifier.daily_digest(text)
-                        write_stamp(stamp, digest.local_day)
-                    except Exception as exc:  # noqa: BLE001 — digest must not kill the loop
-                        logger.warning("Daily digest failed: %s", exc)
+            maybe_send_daily_digest()
 
             if (
                 notifier.active
