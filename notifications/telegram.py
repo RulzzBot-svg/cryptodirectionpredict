@@ -167,8 +167,8 @@ class TelegramNotifier:
             return
         self.send(text)
 
-    def daily_digest(self, text: str) -> None:
-        self.send(text)
+    def daily_digest(self, text: str) -> bool:
+        return self.send(text)
 
     def previous_run_recap(self) -> None:
         """Send a fixed recap of the pre-restart paper run (cloud wipe)."""
