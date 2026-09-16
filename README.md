@@ -169,7 +169,11 @@ paper bets. In live mode the book **mirrors real fills** — a bet is recorded
 only when an order actually fills, at the true fill price plus fee, for the
 quantity that filled (partial fills included). Settlement, W/L, P/L, the vault,
 and Telegram all work off that mirror, and the heartbeat shows your real Kalshi
-cash next to it so any drift is visible. Telegram alerts are prefixed `[LIVE]`.
+cash next to it so any drift is visible. A stuck opening-balance mismatch
+(book started at `$100`, Kalshi is `$69`) used to Telegram **every heartbeat**.
+Drift still alerts once, then at most daily unless the gap moves, or you
+one-shot `RECONCILE_BANK=true` (then set it back to `false`). Telegram
+alerts are prefixed `[LIVE]`.
 
 **Missed fills.** Live orders are IOC, so they either fill immediately or die.
 A miss is retried on a later tick (up to `LIVE_MAX_ATTEMPTS`, default 3) but
@@ -281,6 +285,8 @@ human env change after a clean paper stretch.
 | `DIGEST_HOUR` | `7` | Local hour to send the daily Telegram scorecard |
 | `HAIRCUT_SINCE` | `2026-08-18 17:52:00` | Start of the post-haircut sample in the digest |
 | `TELEGRAM_QUIET` | `true` | Skip per-bet/heartbeat spam; keep digest + halts + vault |
+| `BOOK_DRIFT_ALERT` | `3` | Telegram if live book vs Kalshi cash differs by more than this ($) |
+| `BOOK_DRIFT_COOLDOWN_SECONDS` | `86400` | Re-send a stuck drift at most once per day (not every heartbeat) |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |

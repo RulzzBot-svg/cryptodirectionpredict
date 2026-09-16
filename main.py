@@ -52,6 +52,7 @@ from data.kalshi import (
 )
 from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
 from data.price_tape import PriceTape
+from config.book_drift import should_notify_drift, signed_drift
 from config.kalshi_fees import net_edge
 from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
 from execution.prediction_book import PredictionBook
@@ -216,6 +217,11 @@ SETTLE_REQUIRE_OFFICIAL = os.getenv("SETTLE_REQUIRE_OFFICIAL", "true").strip().l
 SETTLE_WAIT_SECONDS = float(os.getenv("SETTLE_WAIT_SECONDS", "600"))
 # Alert when the book and the real Kalshi balance disagree by more than this
 BOOK_DRIFT_ALERT = float(os.getenv("BOOK_DRIFT_ALERT", "3"))
+# Quiet mode still sends drift (important=True). Without a cooldown that is
+# one Telegram per heartbeat (~15 min) for a stuck opening-balance mismatch.
+BOOK_DRIFT_COOLDOWN_SECONDS = float(
+    os.getenv("BOOK_DRIFT_COOLDOWN_SECONDS", "86400")
+)
 # One-shot: set the book's cash to the real Kalshi balance, keeping bet history.
 # For use after depositing or withdrawing, which the book can't observe.
 RECONCILE_BANK = os.getenv("RECONCILE_BANK", "false").strip().lower() in {
@@ -772,6 +778,8 @@ async def run_bot(
     last_backup_at = datetime.now(timezone.utc).timestamp()
     last_calibration_at = 0.0
     last_heartbeat_at = 0.0
+    last_drift_alert_ts = 0.0
+    last_drift_alert_value: Optional[float] = None
     last_cal_window = ""
 
     try:
@@ -1721,19 +1729,29 @@ async def run_bot(
                         # be sitting there depending on whether it's actually
                         # been withdrawn, so accept either reading and only
                         # complain when neither reconciles.
-                        bank_only = float(stats_hb["usd_balance"]) - balance
-                        with_vault = (
-                            bank_only + float(stats_hb.get("vaulted_usd") or 0.0)
+                        drift = signed_drift(
+                            float(stats_hb["usd_balance"]),
+                            float(stats_hb.get("vaulted_usd") or 0.0),
+                            balance,
                         )
-                        drift = min((bank_only, with_vault), key=abs)
-                        if abs(drift) > BOOK_DRIFT_ALERT:
+                        if should_notify_drift(
+                            drift=drift,
+                            threshold=BOOK_DRIFT_ALERT,
+                            now_ts=now_ts,
+                            last_sent_ts=last_drift_alert_ts,
+                            last_sent_drift=last_drift_alert_value,
+                            cooldown_seconds=BOOK_DRIFT_COOLDOWN_SECONDS,
+                        ):
                             notifier.info(
                                 f"BOOK DRIFT ${drift:+,.2f} — bank "
                                 f"${stats_hb['usd_balance']:,.2f} vs Kalshi "
-                                f"${balance:,.2f}. Kalshi is correct; the book is "
-                                "recording outcomes that don't match.",
+                                f"${balance:,.2f}. Kalshi is correct. One-shot "
+                                "RECONCILE_BANK=true if this is an opening "
+                                "balance mismatch (then set it back to false).",
                                 important=True,
                             )
+                            last_drift_alert_ts = now_ts
+                            last_drift_alert_value = drift
                     except KalshiAuthError as exc:
                         logger.warning("Heartbeat balance check failed: %s", exc)
                     orders_sent = live_fill_count + live_miss_count
