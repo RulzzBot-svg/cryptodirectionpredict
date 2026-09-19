@@ -48,6 +48,11 @@ class DailyDigest:
         if self.halt_detail:
             return f"HALTED — {self.halt_detail}"
         if self.live:
+            if self.since_haircut.n == 0:
+                return (
+                    "LIVE armed — 0 tickets since haircut; "
+                    "maker may be starving (try LIVE_ORDER_MODE=taker)"
+                )
             return "LIVE armed — same $5 / 60–74 / halt+blackout"
         if self.since_haircut.n < 40:
             return (
