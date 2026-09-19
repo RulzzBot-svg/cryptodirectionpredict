@@ -205,6 +205,11 @@ a wide ask no longer kills volume. Rest prices still respect `MIN_ENTRY_PRICE`
 (no more sub-floor maker fills). That trades instant execution for a much
 longer window to get hit, at roughly a **quarter of the fee**.
 
+Haircut + `MIN_EDGE=0.08` + 60–74¢ vs the **bid** often means **no rest
+clears**. Paper was quoting the ask, so live maker can sit at zero fills for
+days. Default `LIVE_TAKER_FALLBACK=true` then crosses the ask on that same
+ticket. Set `LIVE_ORDER_MODE=taker` to skip resting entirely.
+
 The trade-off is adverse selection — a resting bid tends to get filled exactly
 when the price is moving against it. The short expiry limits how stale the
 quote can get, orders are cancelled when the window rolls or the bot stops, and
@@ -281,6 +286,7 @@ human env change after a clean paper stretch.
 | `DIGEST_HOUR` | `7` | Local hour to send the daily Telegram scorecard |
 | `HAIRCUT_SINCE` | `2026-08-18 17:52:00` | Start of the post-haircut sample in the digest |
 | `TELEGRAM_QUIET` | `true` | Skip per-bet/heartbeat spam; keep digest + halts + vault |
+| `LIVE_TAKER_FALLBACK` | `true` | If maker cannot rest, take the ask (same ticket paper would take) |
 | `LOOP_INTERVAL_SECONDS` | `10` | Poll cadence |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `bot.log` | File that mirrors terminal output |
 | `BACKUP_DIR` | `/opt/cursor/artifacts/paper-bot-backups` | Durable copy location |

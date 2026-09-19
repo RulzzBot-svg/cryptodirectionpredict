@@ -48,6 +48,20 @@ def test_stay_paper_under_40() -> None:
     assert "SINCE_HAIRCUT: n=31 wr=74.2% pnl=$+15.35" in text
 
 
+def test_live_starved_call_line() -> None:
+    d = _digest(
+        live=True,
+        since_haircut=Slice(n=0, wins=0, pnl=0.0),
+        full=Slice(n=419, wins=220, pnl=221.23),
+    )
+    assert "0 tickets since haircut" in d.call_line()
+    armed = _digest(
+        live=True,
+        since_haircut=Slice(n=12, wins=8, pnl=4.0),
+    )
+    assert armed.call_line() == "LIVE armed — same $5 / 60–74 / halt+blackout"
+
+
 def test_sample_ok_at_40() -> None:
     d = _digest(since_haircut=Slice(n=40, wins=28, pnl=12.0))
     assert "PAPER sample OK" in d.call_line()
@@ -83,6 +97,7 @@ def test_stamp_path_render_sqlite() -> None:
 
 if __name__ == "__main__":
     test_stay_paper_under_40()
+    test_live_starved_call_line()
     test_sample_ok_at_40()
     test_halt_and_kill_day()
     test_digest_due_once_per_local_morning()

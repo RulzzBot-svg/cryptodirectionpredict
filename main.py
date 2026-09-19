@@ -191,6 +191,14 @@ MAKER_ANY_SIDE = os.getenv("MAKER_ANY_SIDE", "false").strip().lower() in {
     "yes",
     "on",
 }
+# Maker + haircut + 8¢ vs the bid starves live (paper was vs the ask).
+# When a rest cannot be quoted or time is too short, cross as taker.
+LIVE_TAKER_FALLBACK = os.getenv("LIVE_TAKER_FALLBACK", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 # Fee mode for edge gates + paper fills: taker | maker | none
 # Live maker/taker paths always fee-adjust using their true mode; this mainly
 # controls paper + advisor when deciding before an order type is chosen.
@@ -562,6 +570,8 @@ async def run_bot(
             f"  Live pricing    : orderbook-first | mode {LIVE_ORDER_MODE} | "
             f"rest {LIVE_REST_SECONDS:.0f}s | any-side "
             f"{'ON' if MAKER_ANY_SIDE else 'OFF'}"
+            f" | taker-fallback "
+            f"{'ON' if LIVE_TAKER_FALLBACK else 'OFF'}"
         )
     print(
         f"  Fee model       : edge+paper use {_advisor_fee_mode()} "
@@ -1403,6 +1413,7 @@ async def run_bot(
                                 )
                             depth_note = ""
 
+                            maker_rested = False
                             if LIVE_ORDER_MODE == "maker":
                                 remain = window.seconds_remaining()
                                 min_maker_remain = max(
@@ -1414,6 +1425,12 @@ async def run_bot(
                                         f"[{_utcnow_label()}] LIVE skip — only "
                                         f"{remain:.0f}s left, need "
                                         f"{min_maker_remain:.0f}s to rest"
+                                        + (
+                                            "; will take the ask"
+                                            if LIVE_TAKER_FALLBACK
+                                            and advice.should_bet
+                                            else ""
+                                        )
                                     )
                                 elif book_now is None:
                                     note_skip("no bid to join")
@@ -1452,8 +1469,15 @@ async def run_bot(
                                         if chosen is None or edge > chosen[2]:
                                             chosen = (side, rest_price, edge, model)
                                     if chosen is None:
-                                        # Common — don't spam logs every tick.
+                                        # Common with haircut+8¢ vs the bid.
                                         note_skip("no maker price with edge")
+                                        if LIVE_TAKER_FALLBACK and advice.should_bet:
+                                            print(
+                                                f"[{_utcnow_label()}] LIVE maker "
+                                                f"has no rest that clears "
+                                                f"{MIN_EDGE*100:.0f}¢ — taking "
+                                                f"the ask"
+                                            )
                                     else:
                                         side, rest_price, edge, model_now = chosen
                                         ask_now = book_now.ask_for(side)
@@ -1480,6 +1504,7 @@ async def run_bot(
                                                 f"{ticker}{depth_note}"
                                             )
                                         else:
+                                            maker_rested = True
                                             resting_advice = replace(
                                                 advice,
                                                 action=side,  # type: ignore[arg-type]
@@ -1499,7 +1524,15 @@ async def run_bot(
                                                 f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
                                                 f"{depth_note}"
                                             )
-                            elif advice.should_bet and advice.entry_share_price is not None:
+                            if (
+                                not maker_rested
+                                and advice.should_bet
+                                and advice.entry_share_price is not None
+                                and (
+                                    LIVE_ORDER_MODE != "maker"
+                                    or LIVE_TAKER_FALLBACK
+                                )
+                            ):
                                 # Taker: require a readable book and re-check
                                 # net edge + entry bounds at submit time.
                                 ask_now = float(advice.entry_share_price)
