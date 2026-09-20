@@ -12,7 +12,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
-from data.kalshi_auth import KalshiAuthClient, KalshiAuthError
+from data.kalshi_auth import (
+    KalshiAuthClient,
+    KalshiAuthError,
+    humanize_kalshi_order_error,
+)
 from config.kalshi_fees import fee_amount_to_dollars, maker_fee
 
 logger = logging.getLogger(__name__)
@@ -184,6 +188,9 @@ class LiveKalshiExecutor:
             "price": _fp_price(yes_price),
             "time_in_force": time_in_force,
             "self_trade_prevention_type": "taker_at_cross",
+            # BTC 15m lives on the crypto shard (2) as of Aug 2026. -1 =
+            # auto-route by ticker so we do not post to default shard 0.
+            "exchange_index": -1,
         }
         return payload, book_side, yes_price
 
@@ -408,7 +415,7 @@ class LiveKalshiExecutor:
                 payload=plan.payload,
                 dry_run=False,
                 submitted=False,
-                error=str(exc),
+                error=humanize_kalshi_order_error(str(exc)),
             )
 
         fill = float(raw.get("fill_count") or 0)

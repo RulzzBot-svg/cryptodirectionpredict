@@ -45,8 +45,27 @@ class KalshiBalance:
         return self.portfolio_value_cents / 100.0
 
 
+# KXBTC15M (and other crypto) events created after 2026-08-24 live here.
+KALSHI_CRYPTO_SHARD = 2
+KALSHI_DEFAULT_SHARD = 0
+
+
 class KalshiAuthError(RuntimeError):
     """Raised when Kalshi credentials are missing or invalid."""
+
+
+def humanize_kalshi_order_error(text: str) -> str:
+    """Turn shard 404s into an operator action, not a mystery dry-run."""
+    raw = text or ""
+    if "insufficient_shard_balance" in raw or "Exchange user not found" in raw:
+        return (
+            "Kalshi crypto shard has no cash (BTC 15m is exchange index 2 "
+            "since Aug 24 2026). Your Default-shard balance cannot buy "
+            "KXBTC15M. In the Kalshi app: Portfolio → transfer / move funds "
+            "to the Crypto exchange, then leave a few dollars there. "
+            f"API: {raw[:180]}"
+        )
+    return raw
 
 
 def _normalize_pem(raw: bytes) -> bytes:
@@ -201,9 +220,14 @@ class KalshiAuthClient:
         )
         return response
 
-    def get_balance(self) -> KalshiBalance:
-        """GET /portfolio/balance — safest smoke test for API keys."""
-        response = self.request("GET", "/portfolio/balance")
+    def get_balance(self, exchange_index: Optional[int] = None) -> KalshiBalance:
+        """GET /portfolio/balance — safest smoke test for API keys.
+
+        Omit ``exchange_index`` for the all-shard total. Pass 0 (default) or 2
+        (crypto, where KXBTC15M lives since Aug 2026) to scope one shard.
+        """
+        params = None if exchange_index is None else {"exchange_index": int(exchange_index)}
+        response = self.request("GET", "/portfolio/balance", params=params)
         if response.status_code == 401:
             raise KalshiAuthError(
                 "401 Unauthorized — check API Key ID, private key PEM, "
@@ -225,7 +249,14 @@ class KalshiAuthClient:
 
     def create_order_v2(self, order: dict[str, Any]) -> dict[str, Any]:
         """POST /portfolio/events/orders — places a real order when called."""
-        response = self.request("POST", "/portfolio/events/orders", json_body=order)
+        # Query + body: omit/0 hits shard 0; crypto BTC 15m is shard 2.
+        idx = order.get("exchange_index", -1)
+        response = self.request(
+            "POST",
+            "/portfolio/events/orders",
+            params={"exchange_index": idx},
+            json_body=order,
+        )
         if response.status_code == 401:
             raise KalshiAuthError("401 Unauthorized creating order")
         if response.status_code >= 400:

@@ -131,6 +131,14 @@ That call only reads `/portfolio/balance`. It does **not** place orders.
 Paper trading keeps using the public Kalshi feed; authenticated keys are for
 live later. Keep `LIVE_TRADING=false` until after the paper week review.
 
+**Crypto shard (Aug 2026+).** New `KXBTC15M` windows live on Kalshi
+**exchange index 2**. Cash that sits on the Default shard (index 0) cannot
+buy those contracts — orders 404 with `insufficient_shard_balance` /
+`Exchange user not found`. In the Kalshi app, transfer funds to the
+**Crypto** exchange (Portfolio → transfers). Live orders send
+`exchange_index=-1` so they auto-route by ticker. A failed live submit is
+Telegram `LIVE FAILED`, not `DRY-RUN`.
+
 **Live scaffold (orders still off):** Kalshi V2 order payloads are built in
 `execution/live_kalshi.py`. Real submits are hard-blocked until
 **2026-07-30** and require `LIVE_CONFIRM=YES_I_FINISHED_PAPER_WEEK`.
