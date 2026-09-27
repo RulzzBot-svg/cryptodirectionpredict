@@ -50,7 +50,13 @@ from data.kalshi import (
     fetch_orderbook,
     fetch_window_settlement,
 )
-from data.kalshi_auth import KalshiAuthClient, KalshiAuthError, credentials_configured
+from data.kalshi_auth import (
+    KALSHI_CRYPTO_SHARD,
+    KALSHI_DEFAULT_SHARD,
+    KalshiAuthClient,
+    KalshiAuthError,
+    credentials_configured,
+)
 from data.price_tape import PriceTape
 from config.kalshi_fees import net_edge
 from execution.live_kalshi import LiveKalshiExecutor, RestingOrder
@@ -673,6 +679,31 @@ async def run_bot(
                     f"[{_utcnow_label()}] Kalshi auth OK | "
                     f"cash ${bal.balance_usd:,.2f} | base {auth_client.base_url}"
                 )
+                if LIVE_TRADING:
+                    try:
+                        default_bal = auth_client.get_balance(
+                            exchange_index=KALSHI_DEFAULT_SHARD
+                        )
+                        crypto_bal = auth_client.get_balance(
+                            exchange_index=KALSHI_CRYPTO_SHARD
+                        )
+                        print(
+                            f"[{_utcnow_label()}] Kalshi shards | "
+                            f"default ${default_bal.balance_usd:,.2f} | "
+                            f"crypto ${crypto_bal.balance_usd:,.2f} "
+                            f"(KXBTC15M needs crypto / index {KALSHI_CRYPTO_SHARD})"
+                        )
+                        if crypto_bal.balance_usd < 5.0:
+                            msg = (
+                                f"CRYPTO SHARD empty ${crypto_bal.balance_usd:,.2f} "
+                                f"(default ${default_bal.balance_usd:,.2f}). "
+                                "BTC 15m cannot fill until you move cash to the "
+                                "Crypto exchange in the Kalshi app."
+                            )
+                            print(f"[{_utcnow_label()}] {msg}")
+                            notifier.info(msg, important=True)
+                    except KalshiAuthError as shard_exc:
+                        logger.warning("Shard balance check failed: %s", shard_exc)
                 if RECONCILE_BANK:
                     book.set_bank(bal.balance_usd, reason="reconciled to Kalshi")
                     print(
@@ -1571,7 +1602,12 @@ async def run_bot(
                                         )
                                     )
                                     live_attempts[window.window_id] = attempts + 1
-                                    note = "ORDER" if live_plan.submitted else "DRY-RUN"
+                                    if live_plan.submitted:
+                                        note = "ORDER"
+                                    elif live_plan.error:
+                                        note = "FAILED"
+                                    else:
+                                        note = "DRY-RUN"
                                     pad = ""
                                     if bid_price > ask_now:
                                         pad = (

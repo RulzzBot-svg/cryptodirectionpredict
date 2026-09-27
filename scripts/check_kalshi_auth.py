@@ -26,6 +26,8 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from data.kalshi_auth import (  # noqa: E402
+    KALSHI_CRYPTO_SHARD,
+    KALSHI_DEFAULT_SHARD,
     KalshiAuthClient,
     KalshiAuthError,
     credentials_configured,
@@ -61,9 +63,19 @@ def main() -> int:
 
     print("Kalshi auth OK (read-only balance check).")
     print(f"  base URL : {client.base_url}")
-    print(f"  cash     : ${balance.balance_usd:,.2f}")
+    print(f"  cash     : ${balance.balance_usd:,.2f} (all shards)")
     if balance.portfolio_value_usd is not None:
         print(f"  portfolio: ${balance.portfolio_value_usd:,.2f}")
+    try:
+        default_bal = client.get_balance(exchange_index=KALSHI_DEFAULT_SHARD)
+        crypto_bal = client.get_balance(exchange_index=KALSHI_CRYPTO_SHARD)
+        print(f"  default shard 0: ${default_bal.balance_usd:,.2f}")
+        print(
+            f"  crypto shard {KALSHI_CRYPTO_SHARD}: ${crypto_bal.balance_usd:,.2f} "
+            "(KXBTC15M needs this > $5)"
+        )
+    except KalshiAuthError as exc:
+        print(f"  shard balances: unavailable ({exc})")
     print(
         "\nNo orders were placed. Keep LIVE trading off until after paper week."
     )

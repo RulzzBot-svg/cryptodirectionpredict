@@ -147,6 +147,11 @@ class TelegramNotifier:
         self.send(msg)
 
     def live_order_plan(self, plan: Any, *, note: str = "DRY-RUN") -> None:
+        err = getattr(plan, "error", None)
+        if self.quiet and not err:
+            return
+        if err and (not note or note == "DRY-RUN"):
+            note = "FAILED"
         msg = (
             f"LIVE {note}\n"
             f"{plan.advice_side} via YES-{plan.book_side} @ "
