@@ -247,6 +247,36 @@ class KalshiAuthClient:
             raw=payload,
         )
 
+    def transfer_between_shards(
+        self,
+        *,
+        usd: float,
+        source_shard: int = KALSHI_DEFAULT_SHARD,
+        dest_shard: int = KALSHI_CRYPTO_SHARD,
+    ) -> dict[str, Any]:
+        """POST /portfolio/intra_exchange_instance_transfer (amount in centicents)."""
+        if usd <= 0:
+            raise KalshiAuthError("transfer amount must be positive")
+        # $1 = 10_000 centicents ($0.0001).
+        amount = int(round(float(usd) * 10_000))
+        body = {
+            "source": "event_contract",
+            "destination": "event_contract",
+            "amount": amount,
+            "source_exchange_shard": int(source_shard),
+            "destination_exchange_shard": int(dest_shard),
+        }
+        response = self.request(
+            "POST",
+            "/portfolio/intra_exchange_instance_transfer",
+            json_body=body,
+        )
+        if response.status_code >= 400:
+            raise KalshiAuthError(
+                f"Shard transfer failed ({response.status_code}): {response.text[:400]}"
+            )
+        return response.json() if response.content else {}
+
     def create_order_v2(self, order: dict[str, Any]) -> dict[str, Any]:
         """POST /portfolio/events/orders — places a real order when called."""
         # Query + body: omit/0 hits shard 0; crypto BTC 15m is shard 2.
