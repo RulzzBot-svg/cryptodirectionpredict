@@ -65,7 +65,11 @@ from execution.digest import (
 )
 from models.db import create_db_engine, create_session_factory, init_db
 from notifications import TelegramNotifier
-from prediction.advisor import PredictionAdvisor
+from prediction.advisor import (
+    PredictionAdvisor,
+    allowed_sides_label,
+    parse_allowed_sides,
+)
 from prediction.probability import haircut_factor
 from prediction.window import WindowManager
 
@@ -83,6 +87,9 @@ MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "0"))
 MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0"))
 MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0"))
 MAX_MODEL_PROB = float(os.getenv("MAX_MODEL_PROB", "0"))
+# Live autopsy Sep 27–Oct 12: ABOVE 13 @ 46.2% −$11, BELOW 21 @ 61.9% −$3.
+# Set ALLOWED_SIDES=BELOW to drop the bleeding leg; does not flip live off.
+ALLOWED_SIDES = parse_allowed_sides()
 # The empirical probability model needs a few hundred bars to describe the
 # shape of the return distribution; the lognormal only needs enough for a
 # volatility estimate.
@@ -544,6 +551,12 @@ async def run_bot(
     print(
         f"  Model filter    : {_bound_label(MIN_MODEL_PROB, MAX_MODEL_PROB, unit='%')}"
     )
+    print(f"  Allowed sides   : {allowed_sides_label(ALLOWED_SIDES)}")
+    if LIVE_TRADING and "ABOVE" in ALLOWED_SIDES:
+        print(
+            "  WARNING          : live ABOVE went 46% WR / -$11; "
+            "set ALLOWED_SIDES=BELOW and keep LIVE_TRADING=false until paper"
+        )
     print(
         f"  Probability     : {os.getenv('PROB_MODEL', 'lognormal')} "
         f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars, "
@@ -708,6 +721,7 @@ async def run_bot(
         max_model_prob=MAX_MODEL_PROB,
         stake_notional=STAKE_NOTIONAL,
         fee_mode=_advisor_fee_mode(),
+        allowed_sides=ALLOWED_SIDES,
     )
     backup_now(database_url=settings.database_url)
     if notifier.active:
@@ -1426,15 +1440,17 @@ async def run_bot(
                                     # already cleared). MAKER_ANY_SIDE=true
                                     # also tries the other leg for volume.
                                     side_order: list[str] = []
-                                    if advice.should_bet:
+                                    if advice.should_bet and advice.action in ALLOWED_SIDES:
                                         side_order.append(advice.action)
                                     if MAKER_ANY_SIDE:
                                         for side in ("ABOVE", "BELOW"):
-                                            if side not in side_order:
+                                            if side in ALLOWED_SIDES and side not in side_order:
                                                 side_order.append(side)
                                     chosen: Optional[
                                         tuple[str, float, float, float]
                                     ] = None
+                                    if not side_order:
+                                        note_skip("side not allowed")
                                     for side in side_order:
                                         model = float(
                                             advice.prob_above
@@ -1451,7 +1467,7 @@ async def run_bot(
                                         rest_price, edge = cand
                                         if chosen is None or edge > chosen[2]:
                                             chosen = (side, rest_price, edge, model)
-                                    if chosen is None:
+                                    if chosen is None and side_order:
                                         # Common — don't spam logs every tick.
                                         note_skip("no maker price with edge")
                                     else:
@@ -1499,7 +1515,11 @@ async def run_bot(
                                                 f"(try {attempts + 1}/{LIVE_MAX_ATTEMPTS})"
                                                 f"{depth_note}"
                                             )
-                            elif advice.should_bet and advice.entry_share_price is not None:
+                            elif (
+                                advice.should_bet
+                                and advice.action in ALLOWED_SIDES
+                                and advice.entry_share_price is not None
+                            ):
                                 # Taker: require a readable book and re-check
                                 # net edge + entry bounds at submit time.
                                 ask_now = float(advice.entry_share_price)
@@ -1692,6 +1712,7 @@ async def run_bot(
                             haircut=haircut_factor(),
                             halt_detail=None if halt_now is None else halt_now.detail,
                             blackout_label=BET_BLACKOUT.label(),
+                            allowed_sides=allowed_sides_label(ALLOWED_SIDES),
                         )
                         text = format_digest(digest)
                         print(f"[{_utcnow_label()}] {text.replace(chr(10), ' | ')}")

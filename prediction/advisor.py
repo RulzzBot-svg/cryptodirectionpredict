@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Iterable, Literal, Optional, Union
 
 from config.kalshi_fees import fee_per_contract, net_edge
 
@@ -11,6 +12,50 @@ from .probability import ProbabilityEstimate, estimate_prob_above
 from .window import PredictionWindow
 
 Side = Literal["ABOVE", "BELOW", "SKIP"]
+VALID_SIDES = frozenset({"ABOVE", "BELOW"})
+
+
+def parse_allowed_sides(
+    raw: Optional[Union[str, Iterable[str]]] = None,
+) -> frozenset[str]:
+    """Which contract legs may fire. Default both; live autopsy says BELOW only.
+
+    Render: ``ALLOWED_SIDES=BELOW`` skips the ABOVE bleed (46% WR / -$11 on
+    the Sep 27–Oct 12 taker book) without touching haircut, stake, or bounds.
+    """
+    if raw is None:
+        raw = os.getenv("ALLOWED_SIDES", "ABOVE,BELOW")
+    if isinstance(raw, (set, frozenset, list, tuple)):
+        chunks = [str(item) for item in raw]
+    else:
+        chunks = (
+            str(raw)
+            .replace(";", ",")
+            .replace("|", ",")
+            .replace("/", ",")
+            .split(",")
+        )
+    sides: set[str] = set()
+    for chunk in chunks:
+        token = chunk.strip().upper()
+        if token in {"YES", "Y"}:
+            token = "ABOVE"
+        elif token in {"NO", "N"}:
+            token = "BELOW"
+        if token in VALID_SIDES:
+            sides.add(token)
+    return frozenset(sides) if sides else frozenset(VALID_SIDES)
+
+
+def allowed_sides_label(sides: Iterable[str]) -> str:
+    present = frozenset(sides) & VALID_SIDES
+    if present == VALID_SIDES:
+        return "ABOVE,BELOW"
+    if present == frozenset({"BELOW"}):
+        return "BELOW"
+    if present == frozenset({"ABOVE"}):
+        return "ABOVE"
+    return "ABOVE,BELOW"
 
 
 @dataclass(frozen=True)
@@ -69,6 +114,7 @@ class PredictionAdvisor:
         max_model_prob: float = 0.0,
         stake_notional: float = 5.0,
         fee_mode: str = "taker",  # taker | maker | none
+        allowed_sides: Optional[Union[str, Iterable[str]]] = None,
     ) -> None:
         self.min_edge = min_edge
         self.market_prob_above = market_prob_above
@@ -81,6 +127,7 @@ class PredictionAdvisor:
         self.max_model_prob = float(max_model_prob or 0.0)
         self.stake_notional = max(float(stake_notional), 0.01)
         self.fee_mode = (fee_mode or "taker").strip().lower()
+        self.allowed_sides = parse_allowed_sides(allowed_sides)
 
     @staticmethod
     def _valid_ask(value: Optional[float]) -> Optional[float]:
@@ -226,66 +273,71 @@ class PredictionAdvisor:
         edge_above = self._net_edge(estimate.prob_above, yes)
         edge_below = self._net_edge(estimate.prob_below, no)
 
-        action: Side = "SKIP"
-        edge = 0.0
-        model_prob = 0.0
-        entry = 0.0
-        reason = ""
+        ranked: list[tuple[float, Side, float, float]] = []
+        if "ABOVE" in self.allowed_sides:
+            ranked.append((edge_above, "ABOVE", estimate.prob_above, yes))
+        if "BELOW" in self.allowed_sides:
+            ranked.append((edge_below, "BELOW", estimate.prob_below, no))
+        ranked.sort(key=lambda row: row[0], reverse=True)
 
-        if edge_above >= self.min_edge and edge_above >= edge_below:
-            action = "ABOVE"
-            edge = edge_above
-            model_prob = estimate.prob_above
-            entry = yes
-            fee_cents = self._fee_drag(yes) * 100.0
-            reason = (
-                f"model {estimate.prob_above_pct:.1f}% ABOVE vs YES ask "
-                f"{yes * 100:.1f}¢ (net edge {edge_above * 100:.1f}¢"
-                f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
-            )
-        elif edge_below >= self.min_edge:
-            action = "BELOW"
-            edge = edge_below
-            model_prob = estimate.prob_below
-            entry = no
-            fee_cents = self._fee_drag(no) * 100.0
-            reason = (
-                f"model {estimate.prob_below_pct:.1f}% BELOW vs NO ask "
-                f"{no * 100:.1f}¢ (net edge {edge_below * 100:.1f}¢"
-                f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
-            )
-        else:
-            best_edge = max(edge_above, edge_below)
-            return self._skip(
-                estimate,
-                edge=best_edge,
-                reason=(
-                    f"no net edge (best {best_edge * 100:+.1f}¢ after fees, need "
-                    f"{self.min_edge * 100:.0f}¢)"
-                ),
-                yes=yes,
-                no=no,
-            )
+        disabled_note = ""
+        if "ABOVE" not in self.allowed_sides and edge_above >= self.min_edge:
+            disabled_note = f"ABOVE disabled ({edge_above * 100:.1f}¢ edge). "
+        elif "BELOW" not in self.allowed_sides and edge_below >= self.min_edge:
+            disabled_note = f"BELOW disabled ({edge_below * 100:.1f}¢ edge). "
 
-        blocked = self._filter_skip_reason(model_prob=model_prob, entry=entry)
-        if blocked is not None:
-            return self._skip(
-                estimate,
+        blocked_reasons: list[str] = []
+        for edge, action, model_prob, entry in ranked:
+            if edge < self.min_edge:
+                continue
+            blocked = self._filter_skip_reason(model_prob=model_prob, entry=entry)
+            if blocked is not None:
+                blocked_reasons.append(f"{action}: {blocked}")
+                continue
+            if action == "ABOVE":
+                fee_cents = self._fee_drag(yes) * 100.0
+                reason = (
+                    f"model {estimate.prob_above_pct:.1f}% ABOVE vs YES ask "
+                    f"{yes * 100:.1f}¢ (net edge {edge_above * 100:.1f}¢"
+                    f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
+                )
+            else:
+                fee_cents = self._fee_drag(no) * 100.0
+                reason = (
+                    f"model {estimate.prob_below_pct:.1f}% BELOW vs NO ask "
+                    f"{no * 100:.1f}¢ (net edge {edge_below * 100:.1f}¢"
+                    f"{f', fee ~{fee_cents:.1f}¢' if fee_cents > 0 else ''})"
+                )
+            return Advice(
+                action=action,
+                prob_above=estimate.prob_above,
+                prob_below=estimate.prob_below,
                 edge=edge,
-                reason=f"skip {action}: {blocked}",
+                fair_yes_cents=estimate.prob_above * 100.0,
+                fair_no_cents=estimate.prob_below * 100.0,
+                reason=reason,
+                estimate=estimate,
+                yes_ask=yes,
+                no_ask=no,
+            )
+
+        if blocked_reasons:
+            return self._skip(
+                estimate,
+                edge=max((row[0] for row in ranked), default=0.0),
+                reason=f"{disabled_note}skip {'; '.join(blocked_reasons)}".strip(),
                 yes=yes,
                 no=no,
             )
 
-        return Advice(
-            action=action,
-            prob_above=estimate.prob_above,
-            prob_below=estimate.prob_below,
-            edge=edge,
-            fair_yes_cents=estimate.prob_above * 100.0,
-            fair_no_cents=estimate.prob_below * 100.0,
-            reason=reason,
-            estimate=estimate,
-            yes_ask=yes,
-            no_ask=no,
+        best_edge = max((row[0] for row in ranked), default=max(edge_above, edge_below))
+        return self._skip(
+            estimate,
+            edge=best_edge,
+            reason=(
+                f"{disabled_note}no net edge (best {best_edge * 100:+.1f}¢ after fees, need "
+                f"{self.min_edge * 100:.0f}¢)"
+            ).strip(),
+            yes=yes,
+            no=no,
         )

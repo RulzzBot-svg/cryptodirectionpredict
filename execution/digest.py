@@ -39,6 +39,7 @@ class DailyDigest:
     last50: Slice
     halt_detail: Optional[str]
     blackout_label: str
+    allowed_sides: str = "ABOVE,BELOW"
 
     @property
     def all_in(self) -> float:
@@ -48,7 +49,14 @@ class DailyDigest:
         if self.halt_detail:
             return f"HALTED — {self.halt_detail}"
         if self.live:
-            return "LIVE armed — same $5 / 60–74 / halt+blackout"
+            sides = (self.allowed_sides or "ABOVE,BELOW").upper()
+            if sides == "BELOW":
+                side_bit = "BELOW only / "
+            elif sides == "ABOVE":
+                side_bit = "ABOVE only / "
+            else:
+                side_bit = "both sides / "
+            return f"LIVE armed — {side_bit}$5 / 60–74 / halt+blackout"
         if self.since_haircut.n < 40:
             return (
                 f"STAY PAPER — haircut sample {self.since_haircut.n} "
@@ -138,6 +146,7 @@ def load_digest(
     haircut: float,
     halt_detail: Optional[str],
     blackout_label: str,
+    allowed_sides: str = "ABOVE,BELOW",
     now: Optional[datetime] = None,
 ) -> DailyDigest:
     instant = now or datetime.now(timezone.utc)
@@ -192,6 +201,7 @@ def load_digest(
         last50=_slice_of(last50),
         halt_detail=halt_detail,
         blackout_label=blackout_label,
+        allowed_sides=allowed_sides,
     )
 
 
@@ -218,6 +228,7 @@ def format_digest(d: DailyDigest) -> str:
             line("LAST50", d.last50),
             f"Halt: {halt}",
             f"Blackout: {d.blackout_label}",
+            f"Sides: {d.allowed_sides}",
             f"Call: {d.call_line()}",
         ]
     )
