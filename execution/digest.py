@@ -39,7 +39,7 @@ class DailyDigest:
     last50: Slice
     halt_detail: Optional[str]
     blackout_label: str
-    allowed_sides: str = "ABOVE,BELOW"
+    allowed_sides: str = "BELOW"
 
     @property
     def all_in(self) -> float:
@@ -49,7 +49,7 @@ class DailyDigest:
         if self.halt_detail:
             return f"HALTED — {self.halt_detail}"
         if self.live:
-            sides = (self.allowed_sides or "ABOVE,BELOW").upper()
+            sides = (self.allowed_sides or "BELOW").upper()
             if sides == "BELOW":
                 side_bit = "BELOW only / "
             elif sides == "ABOVE":
@@ -146,7 +146,7 @@ def load_digest(
     haircut: float,
     halt_detail: Optional[str],
     blackout_label: str,
-    allowed_sides: str = "ABOVE,BELOW",
+    allowed_sides: str = "BELOW",
     now: Optional[datetime] = None,
 ) -> DailyDigest:
     instant = now or datetime.now(timezone.utc)

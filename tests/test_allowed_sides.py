@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,10 +73,19 @@ def test_parse_allowed_sides() -> None:
     assert parse_allowed_sides("BELOW") == frozenset({"BELOW"})
     assert parse_allowed_sides("no") == frozenset({"BELOW"})
     assert parse_allowed_sides("YES,BELOW") == frozenset({"ABOVE", "BELOW"})
-    assert parse_allowed_sides("") == frozenset({"ABOVE", "BELOW"})
-    assert parse_allowed_sides("garbage") == frozenset({"ABOVE", "BELOW"})
+    assert parse_allowed_sides("ALL") == frozenset({"ABOVE", "BELOW"})
+    assert parse_allowed_sides("") == frozenset({"BELOW"})
+    assert parse_allowed_sides("garbage") == frozenset({"BELOW"})
     assert allowed_sides_label(parse_allowed_sides("BELOW")) == "BELOW"
     assert allowed_sides_label(parse_allowed_sides("ABOVE,BELOW")) == "ABOVE,BELOW"
+    old = os.environ.pop("ALLOWED_SIDES", None)
+    try:
+        assert parse_allowed_sides() == frozenset({"BELOW"})
+    finally:
+        if old is None:
+            os.environ.pop("ALLOWED_SIDES", None)
+        else:
+            os.environ["ALLOWED_SIDES"] = old
 
 
 def test_below_only_skips_above_edge_without_flipping_the_other_leg() -> None:
@@ -89,6 +99,33 @@ def test_below_only_skips_above_edge_without_flipping_the_other_leg() -> None:
     assert below_only.action == "SKIP"
     assert "ABOVE disabled" in below_only.reason
     assert "no net edge" in below_only.reason
+
+
+def test_unset_env_defaults_advisor_to_below_only() -> None:
+    old = os.environ.pop("ALLOWED_SIDES", None)
+    try:
+        advisor = PredictionAdvisor(
+            min_edge=0.08,
+            min_seconds_to_bet=20.0,
+            require_tradable_quotes=True,
+            stake_notional=5.0,
+            fee_mode="none",
+        )
+        with patch(
+            "prediction.advisor.estimate_prob_above",
+            return_value=_estimate(0.75),
+        ):
+            advice = advisor.advise(
+                _window(), spot=100_000.0, candles=None, yes_ask=0.63, no_ask=0.37
+            )
+        assert advisor.allowed_sides == frozenset({"BELOW"})
+        assert advice.action == "SKIP"
+        assert "ABOVE disabled" in advice.reason
+    finally:
+        if old is None:
+            os.environ.pop("ALLOWED_SIDES", None)
+        else:
+            os.environ["ALLOWED_SIDES"] = old
 
 
 def test_below_only_still_takes_a_real_below_edge() -> None:
@@ -110,6 +147,7 @@ def test_disabled_side_does_not_steal_a_weaker_allowed_leg() -> None:
 if __name__ == "__main__":
     test_parse_allowed_sides()
     test_below_only_skips_above_edge_without_flipping_the_other_leg()
+    test_unset_env_defaults_advisor_to_below_only()
     test_below_only_still_takes_a_real_below_edge()
     test_disabled_side_does_not_steal_a_weaker_allowed_leg()
     print("allowed-sides tests ok")

@@ -88,7 +88,7 @@ MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0"))
 MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0"))
 MAX_MODEL_PROB = float(os.getenv("MAX_MODEL_PROB", "0"))
 # Live autopsy Sep 27–Oct 12: ABOVE 13 @ 46.2% −$11, BELOW 21 @ 61.9% −$3.
-# Set ALLOWED_SIDES=BELOW to drop the bleeding leg; does not flip live off.
+# Default BELOW-only. LIVE_TRADING is a separate knob — leave it on to spend.
 ALLOWED_SIDES = parse_allowed_sides()
 # The empirical probability model needs a few hundred bars to describe the
 # shape of the return distribution; the lognormal only needs enough for a
@@ -555,8 +555,10 @@ async def run_bot(
     if LIVE_TRADING and "ABOVE" in ALLOWED_SIDES:
         print(
             "  WARNING          : live ABOVE went 46% WR / -$11; "
-            "set ALLOWED_SIDES=BELOW and keep LIVE_TRADING=false until paper"
+            "set ALLOWED_SIDES=BELOW (live can stay on)"
         )
+    elif LIVE_TRADING and ALLOWED_SIDES == frozenset({"BELOW"}):
+        print("  Live sides       : BELOW only — ABOVE skipped, orders still live")
     print(
         f"  Probability     : {os.getenv('PROB_MODEL', 'lognormal')} "
         f"(vol {os.getenv('VOL_ESTIMATOR', 'std')}, {OHLCV_LIMIT} bars, "

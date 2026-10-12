@@ -54,9 +54,13 @@ def test_sample_ok_at_40() -> None:
 
 
 def test_live_call_line_names_sides() -> None:
-    both = _digest(live=True, since_haircut=Slice(n=50, wins=28, pnl=-13.0))
+    both = _digest(
+        live=True,
+        allowed_sides="ABOVE,BELOW",
+        since_haircut=Slice(n=50, wins=28, pnl=-13.0),
+    )
     assert "both sides" in both.call_line()
-    below = _digest(live=True, allowed_sides="BELOW")
+    below = _digest(live=True)
     assert "BELOW only" in below.call_line()
     text = format_digest(below)
     assert "Sides: BELOW" in text

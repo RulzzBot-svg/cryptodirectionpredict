@@ -262,7 +262,7 @@ human env change after a clean paper stretch.
 | `MAX_ENTRY_PRICE` | `0` (off) | Skip if share ask is above this (e.g. `0.74`) |
 | `MIN_MODEL_PROB` | `0` (off) | Skip if model prob on the bet side is below this |
 | `MAX_MODEL_PROB` | `0` (off) | Skip if model prob on the bet side is above this |
-| `ALLOWED_SIDES` | `ABOVE,BELOW` | Legs that may fire. Live autopsy: ABOVE bled (46% / -$11); set `BELOW` to skip it |
+| `ALLOWED_SIDES` | `BELOW` | Legs that may fire. Default skips ABOVE after the 46% / -$11 live bleed. `ABOVE,BELOW` restores both |
 | `MARKET_PROB_ABOVE` | `0.50` | Fallback YES ask if Kalshi quotes missing |
 | `STAKE_NOTIONAL` | `5` | Face value per bet (5 contracts ⇒ pay `5 × share_price`) |
 | `VAULT_ENABLED` | `true` | Auto paper-withdraw profits above working bank |
@@ -326,9 +326,10 @@ model bounds above (e.g. `MIN_ENTRY_PRICE=0.45`, `MAX_ENTRY_PRICE=0.74`,
 Live taker + 60–74¢ + $5 (Sep 27–Oct 12, n=34) then split **by side**, not by
 price: **ABOVE 13 @ 46.2% −$11.02**, **BELOW 21 @ 61.9% −$2.75**. The model
 still claimed ~71–78% (8–16¢ edge) while 63¢ entries need ~63% just to break
-even. Set `ALLOWED_SIDES=BELOW` and keep `LIVE_TRADING=false` until that
-BELOW-only paper sample is green. Do not raise face, drop the haircut, or
-rebuild the predictor on this dump.
+even. Default is now `ALLOWED_SIDES=BELOW` so a deploy stops ABOVE even if
+`LIVE_TRADING` stays on. Halt still skips new bets at a **-$15 day** or
+**cash ≤ $30**. Do not raise face, drop the haircut, or rebuild the predictor
+on this dump. Set `ALLOWED_SIDES=ABOVE,BELOW` only if you want that leg back.
 
 ## Probability model
 

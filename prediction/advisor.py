@@ -13,18 +13,21 @@ from .window import PredictionWindow
 
 Side = Literal["ABOVE", "BELOW", "SKIP"]
 VALID_SIDES = frozenset({"ABOVE", "BELOW"})
+# Live taker autopsy (Sep 27–Oct 12): ABOVE 46% / -$11. Default drops that leg.
+# Set ALLOWED_SIDES=ABOVE,BELOW to put it back. LIVE_TRADING is a separate knob.
+DEFAULT_ALLOWED_SIDES = frozenset({"BELOW"})
 
 
 def parse_allowed_sides(
     raw: Optional[Union[str, Iterable[str]]] = None,
 ) -> frozenset[str]:
-    """Which contract legs may fire. Default both; live autopsy says BELOW only.
+    """Which contract legs may fire. Default BELOW-only after the live ABOVE bleed.
 
-    Render: ``ALLOWED_SIDES=BELOW`` skips the ABOVE bleed (46% WR / -$11 on
-    the Sep 27–Oct 12 taker book) without touching haircut, stake, or bounds.
+    Blank / garbage env falls back to BELOW so a missing Render var cannot
+    silently re-arm ABOVE. Explicit ``ALL`` / ``ABOVE,BELOW`` restores both.
     """
     if raw is None:
-        raw = os.getenv("ALLOWED_SIDES", "ABOVE,BELOW")
+        raw = os.getenv("ALLOWED_SIDES", "BELOW")
     if isinstance(raw, (set, frozenset, list, tuple)):
         chunks = [str(item) for item in raw]
     else:
@@ -35,27 +38,27 @@ def parse_allowed_sides(
             .replace("/", ",")
             .split(",")
         )
+    tokens = [chunk.strip().upper() for chunk in chunks if chunk.strip()]
+    if any(token in {"ALL", "BOTH", "*", "ANY"} for token in tokens):
+        return frozenset(VALID_SIDES)
     sides: set[str] = set()
-    for chunk in chunks:
-        token = chunk.strip().upper()
+    for token in tokens:
         if token in {"YES", "Y"}:
             token = "ABOVE"
         elif token in {"NO", "N"}:
             token = "BELOW"
         if token in VALID_SIDES:
             sides.add(token)
-    return frozenset(sides) if sides else frozenset(VALID_SIDES)
+    return frozenset(sides) if sides else frozenset(DEFAULT_ALLOWED_SIDES)
 
 
 def allowed_sides_label(sides: Iterable[str]) -> str:
     present = frozenset(sides) & VALID_SIDES
     if present == VALID_SIDES:
         return "ABOVE,BELOW"
-    if present == frozenset({"BELOW"}):
-        return "BELOW"
     if present == frozenset({"ABOVE"}):
         return "ABOVE"
-    return "ABOVE,BELOW"
+    return "BELOW"
 
 
 @dataclass(frozen=True)
