@@ -15,11 +15,18 @@ Python 3.12 bot that estimates 15-minute BTC above/below probabilities
 .venv/bin/python main.py
 ```
 
+Paper crypto spot bot (not Kalshi; live locked):
+
+```bash
+.venv/bin/python crypto_bot.py
+```
+
 ### Lint / test / build
 No dedicated lint/test runner yet. Sanity-check with:
 
 ```bash
-.venv/bin/python -m py_compile main.py prediction/*.py execution/*.py models/*.py
+.venv/bin/python -m py_compile main.py crypto_bot.py prediction/*.py execution/*.py models/*.py
+.venv/bin/python tests/test_crypto_paper.py
 .venv/bin/python - <<'PY'
 from prediction import WindowManager, PredictionAdvisor
 print('prediction package ok')

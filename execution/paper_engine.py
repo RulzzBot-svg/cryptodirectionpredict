@@ -35,6 +35,7 @@ class PaperBroker:
         initial_balance: Optional[float] = None,
         symbol: Optional[str] = None,
         engine=None,
+        fee_rate: float = 0.0,
     ) -> None:
         settings = load_settings()
         self.session_factory = session_factory
@@ -44,6 +45,7 @@ class PaperBroker:
             else settings.paper_initial_balance
         )
         self.symbol = symbol or settings.symbol
+        self.fee_rate = max(0.0, float(fee_rate))
         bind = getattr(session_factory, "kw", {}).get("bind")
         init_db(bind if bind is not None else engine)
         self._ensure_portfolio()
@@ -55,6 +57,7 @@ class PaperBroker:
         *,
         initial_balance: Optional[float] = None,
         symbol: Optional[str] = None,
+        fee_rate: float = 0.0,
     ) -> "PaperBroker":
         """Convenience constructor that creates engine + session factory."""
         engine = create_db_engine(database_url)
@@ -65,6 +68,7 @@ class PaperBroker:
             initial_balance=initial_balance,
             symbol=symbol,
             engine=engine,
+            fee_rate=fee_rate,
         )
 
     def _ensure_portfolio(self) -> Portfolio:
@@ -152,10 +156,18 @@ class PaperBroker:
                 self._log("BUY skipped | insufficient USD balance")
                 return None
 
-            btc_qty = usd_to_spend / current_price
+            fee = usd_to_spend * self.fee_rate
+            net_usd = usd_to_spend - fee
+            if net_usd <= 0:
+                self._log("BUY skipped | fee consumes the whole order")
+                return None
+
+            btc_qty = net_usd / current_price
             if btc_qty <= 0:
                 self._log("BUY skipped | calculated BTC quantity is zero")
                 return None
+            # All-in cost per BTC so stops/P/L see the fee, not the print.
+            all_in = usd_to_spend / btc_qty
 
             prev_btc = float(portfolio.btc_balance)
             prev_entry = float(portfolio.avg_entry_price)
@@ -163,7 +175,7 @@ class PaperBroker:
             # Volume-weighted average entry across open inventory
             if new_btc > 0:
                 portfolio.avg_entry_price = (
-                    (prev_btc * prev_entry) + (btc_qty * current_price)
+                    (prev_btc * prev_entry) + (btc_qty * all_in)
                 ) / new_btc
             else:
                 portfolio.avg_entry_price = 0.0
@@ -212,8 +224,10 @@ class PaperBroker:
                 return None
 
             entry = float(portfolio.avg_entry_price)
-            usd_proceeds = btc_qty * current_price
-            realized_pnl = (current_price - entry) * btc_qty if entry > 0 else 0.0
+            gross = btc_qty * current_price
+            fee = gross * self.fee_rate
+            usd_proceeds = gross - fee
+            realized_pnl = usd_proceeds - (entry * btc_qty) if entry > 0 else 0.0
 
             portfolio.usd_balance = float(portfolio.usd_balance) + usd_proceeds
             portfolio.btc_balance = 0.0

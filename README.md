@@ -47,6 +47,25 @@ python main.py --reset-paper       # wipe W/L and start bank at $100
 python main.py
 ```
 
+### Paper crypto spot bot (separate from Kalshi)
+
+The 15m Kalshi bot is a prediction-market scorer. Starting **crypto trading**
+is a different program: long-only BTC spot on 1h candles, paper first.
+
+```bash
+python crypto_bot.py
+```
+
+Defaults: Coinbase `BTC/USD`, 1h EMA 9/21 + RSI filter, **0.60% taker fee**
+each way, **3% stop** from all-in entry, **25%** of USD per buy, one position,
+buy-halt after **-$10** realized on the local day. Database is
+`crypto_paper.db` so it cannot touch `live_trading.db`.
+
+`LIVE_CRYPTO` is hard-off. This is not a proven edge — it is plumbing + a
+dumb trend rule so paper P/L includes fees. Do not fund it with leftover
+Kalshi cash until a paper sample is actually green. Keep the Kalshi worker
+on `LIVE_TRADING=false`; do not run both live on one Render service.
+
 ### Paste Robinhood strike (optional now)
 
 By default the bot **auto-pulls the current Kalshi window** by event ticker
