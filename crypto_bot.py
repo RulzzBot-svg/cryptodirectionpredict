@@ -14,14 +14,24 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from dotenv import load_dotenv
 
 from config.bot_logging import setup_bot_logging, shutdown_bot_logging
 from config.settings import load_settings
-from execution.crypto_risk import day_buy_halted, decide_crypto_action, stop_hit
+from data.backup import backup_now, restore_latest_backup
+from execution.crypto_risk import (
+    assert_crypto_paper_ready,
+    day_buy_halted,
+    decide_crypto_action,
+    format_crypto_digest,
+    stop_hit,
+)
+from execution.digest import digest_due, digest_stamp_path, read_stamp, write_stamp
 from execution.paper_engine import PaperBroker
 from notifications import TelegramNotifier
 from strategies import EMACrossoverStrategy
@@ -51,12 +61,13 @@ async def run_crypto_paper(
     tz_name: str,
     initial_balance: float,
     ohlcv_limit: int,
+    digest_hour: int,
+    heartbeat_seconds: float,
+    backup_seconds: float,
+    reset_paper: bool,
 ) -> None:
-    if _flag("LIVE_CRYPTO"):
-        raise SystemExit(
-            "LIVE_CRYPTO is on, but v1 is paper only. Set LIVE_CRYPTO=false. "
-            "Do not point this at Kalshi live_trading.db or spend the $31 leftover."
-        )
+    assert_crypto_paper_ready(database_url, live_crypto=_flag("LIVE_CRYPTO"))
+    restore_latest_backup(database_url=database_url)
 
     notifier = TelegramNotifier()
     notifier.prefix = "CRYPTO PAPER"
@@ -69,7 +80,7 @@ async def run_crypto_paper(
     )
 
     print("=" * 60)
-    print("  BTC SPOT PAPER BOT")
+    print("  CRYPTO VENTURE — BTC SPOT PAPER")
     print("=" * 60)
     print(f"  Symbol       : {symbol}")
     print(f"  Provider     : {provider}")
@@ -84,6 +95,9 @@ async def run_crypto_paper(
     print(f"  Started      : {_utcnow_label()}")
     print("=" * 60)
 
+    if reset_paper:
+        broker.reset_paper_history(balance=initial_balance)
+
     stats0 = broker.get_performance_stats()
     notifier.info(
         f"CRYPTO PAPER START | {symbol} {timeframe} | "
@@ -91,10 +105,13 @@ async def run_crypto_paper(
         f"stop {stop_pct*100:.1f}% | live locked",
         important=True,
     )
+    backup_now(database_url=database_url)
 
     from data.feed import fetch_latest_snapshot
 
     halted_note_sent = False
+    last_heartbeat = 0.0
+    last_backup = 0.0
     try:
         while True:
             snap = await fetch_latest_snapshot(
@@ -167,6 +184,35 @@ async def run_crypto_paper(
                 end="",
                 flush=True,
             )
+
+            now_ts = time.time()
+            if heartbeat_seconds > 0 and (now_ts - last_heartbeat) >= heartbeat_seconds:
+                last_heartbeat = now_ts
+                notifier.info(
+                    f"CRYPTO heartbeat | {symbol} ${price:,.2f} | {pos} | "
+                    f"eq ${equity:,.2f}{halt}",
+                )
+            if backup_seconds > 0 and (now_ts - last_backup) >= backup_seconds:
+                last_backup = now_ts
+                backup_now(database_url=database_url)
+            stamp = digest_stamp_path(database_url)
+            if notifier.active and digest_due(
+                tz_name=tz_name,
+                hour=digest_hour,
+                last_sent=read_stamp(stamp),
+            ):
+                stats = broker.get_performance_stats(current_price=price)
+                local_day = (
+                    datetime.now(timezone.utc)
+                    .astimezone(ZoneInfo(tz_name))
+                    .date()
+                    .isoformat()
+                )
+                text = format_crypto_digest(stats, local_day=local_day, symbol=symbol)
+                print(f"\n[{_utcnow_label()}] {text.replace(chr(10), ' | ')}")
+                if notifier.daily_digest(text):
+                    write_stamp(stamp, datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date())
+
             await asyncio.sleep(loop_seconds)
     except KeyboardInterrupt:
         print()
@@ -189,6 +235,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--database-url",
         default=os.getenv("CRYPTO_DATABASE_URL", "sqlite:///./crypto_paper.db"),
+    )
+    parser.add_argument(
+        "--reset-paper",
+        action="store_true",
+        help="Wipe crypto paper trades and reset the paper bank",
     )
     return parser.parse_args(argv)
 
@@ -214,6 +265,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                     os.getenv("CRYPTO_PAPER_BALANCE", str(settings.paper_initial_balance))
                 ),
                 ohlcv_limit=int(float(os.getenv("CRYPTO_OHLCV_LIMIT", "80"))),
+                digest_hour=int(float(os.getenv("DIGEST_HOUR", "7"))),
+                heartbeat_seconds=float(os.getenv("HEARTBEAT_EVERY_SECONDS", "900")),
+                backup_seconds=float(os.getenv("BACKUP_EVERY_SECONDS", "300")),
+                reset_paper=bool(args.reset_paper) or _flag("RESET_PAPER_HISTORY"),
             )
         )
     finally:

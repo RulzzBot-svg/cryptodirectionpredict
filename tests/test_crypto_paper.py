@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -14,7 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from execution.crypto_risk import day_buy_halted, decide_crypto_action, stop_hit
+from execution.crypto_risk import (
+    assert_crypto_paper_ready,
+    day_buy_halted,
+    decide_crypto_action,
+    format_crypto_digest,
+    stop_hit,
+)
 from execution.paper_engine import PaperBroker
 from models.db import create_db_engine, create_session_factory, init_db
 
@@ -124,41 +129,53 @@ def test_zero_fee_unchanged() -> None:
         assert abs(float(sell.realized_pnl) - 10.0) < 1e-9
 
 
-def test_live_crypto_flag_is_rejected() -> None:
-    import crypto_bot
-
-    old = os.environ.get("LIVE_CRYPTO")
-    os.environ["LIVE_CRYPTO"] = "true"
+def test_refuses_kalshi_db_and_live_flag() -> None:
+    raised = False
     try:
-        raised = False
-        try:
-            import asyncio
+        assert_crypto_paper_ready(
+            "sqlite:////var/data/live_trading.db", live_crypto=False
+        )
+    except SystemExit as exc:
+        raised = True
+        assert "Kalshi" in str(exc)
+    assert raised
+    raised = False
+    try:
+        assert_crypto_paper_ready("sqlite:///./crypto_paper.db", live_crypto=True)
+    except SystemExit as exc:
+        raised = True
+        assert "paper only" in str(exc).lower()
+    assert raised
+    assert_crypto_paper_ready("sqlite:////var/data/crypto_paper.db", live_crypto=False)
 
-            asyncio.run(
-                crypto_bot.run_crypto_paper(
-                    database_url="sqlite:///:memory:",
-                    symbol="BTC/USD",
-                    provider="coinbase",
-                    timeframe="1h",
-                    loop_seconds=1,
-                    fee_rate=0.006,
-                    stop_pct=0.03,
-                    position_pct=0.25,
-                    day_loss=10,
-                    tz_name="America/Los_Angeles",
-                    initial_balance=100,
-                    ohlcv_limit=20,
-                )
-            )
-        except SystemExit as exc:
-            raised = True
-            assert "paper only" in str(exc).lower() or "LIVE_CRYPTO" in str(exc)
-        assert raised
-    finally:
-        if old is None:
-            os.environ.pop("LIVE_CRYPTO", None)
-        else:
-            os.environ["LIVE_CRYPTO"] = old
+
+def test_crypto_digest_and_reset() -> None:
+    text = format_crypto_digest(
+        {
+            "equity": 98.5,
+            "usd_balance": 98.5,
+            "btc_balance": 0.0,
+            "realized_pnl": -1.5,
+            "unrealized_pnl": 0.0,
+            "win_count": 0,
+            "loss_count": 1,
+            "sell_count": 1,
+            "win_rate_pct": 0.0,
+            "total_return_pct": -1.5,
+        },
+        local_day="2026-10-30",
+        symbol="BTC/USD",
+    )
+    assert "CRYPTO DAILY 2026-10-30" in text
+    assert "stay paper" in text
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp, fee_rate=0.0)
+        broker.execute_order("BUY", 50_000.0, position_size_pct=1.0)
+        broker.reset_paper_history(balance=100.0)
+        pf = broker.get_portfolio()
+        assert pf["usd_balance"] == 100.0
+        assert pf["btc_balance"] == 0.0
+        assert broker.get_trades() == []
 
 
 if __name__ == "__main__":
@@ -166,5 +183,6 @@ if __name__ == "__main__":
     test_day_buy_halted_local_day()
     test_fees_drag_round_trip()
     test_zero_fee_unchanged()
-    test_live_crypto_flag_is_rejected()
+    test_refuses_kalshi_db_and_live_flag()
+    test_crypto_digest_and_reset()
     print("crypto paper tests ok")

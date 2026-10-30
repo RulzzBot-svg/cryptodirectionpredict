@@ -1,37 +1,56 @@
-# BTC 15-Minute Prediction Edge Bot
+# Crypto paper trader (BTC spot)
 
-Estimates the probability that Bitcoin finishes **above** or **below** the
-current 15-minute strike (Robinhood / Kalshi-style windows) and recommends
-whether to buy that side.
+New venture: a **paper** long-only Bitcoin bot on Coinbase 1h candles.
+The old Kalshi 15-minute above/below bot is legacy — leave it off.
 
-## What it does
+```bash
+python crypto_bot.py
+```
 
-Every ~10 seconds the bot:
+This is not live trading. `LIVE_CRYPTO` is locked. Fees (0.60% taker), a 3%
+stop, one position, and a daily buy-halt are on so paper cannot look free.
 
-1. Locks (or refreshes) the current wall-clock **15m window** and **strike**
-2. Estimates realized volatility from recent candles
-3. Computes **P(finish ABOVE strike)** with a driftless lognormal model
-4. Compares that probability to a reference market price (default 50¢)
-5. Recommends **ABOVE**, **BELOW**, or **SKIP**
-6. Optionally papers a position sized by `STAKE_NOTIONAL` when edge ≥ `MIN_EDGE`
+## What you do on Render (this is the whole list)
 
-Live status line example:
+Use the **existing** worker. Do not create a second service. Do not add cash.
+
+1. Deploy this branch (start command must be `python crypto_bot.py`, not `main.py`).
+2. Set `LIVE_TRADING=false` and `LIVE_CRYPTO=false`.
+3. Set `CRYPTO_DATABASE_URL=sqlite:////var/data/crypto_paper.db`  
+   (never `live_trading.db`).
+4. Keep Coinbase as public data only — **no** Coinbase API keys yet.
+5. Leave the ~$31 Kalshi leftover parked or withdraw it. This bot cannot spend it.
+6. Watch Telegram for `CRYPTO PAPER START`, then one daily scorecard around 7am LA.
+
+Paper bank starts at $100 fake dollars. When that book is actually green over a
+real sample, we talk about tiny live size. Not before.
+
+## What the paper bot does
+
+Every ~60 seconds the bot:
+
+1. Pulls Coinbase `BTC/USD` last price + 1h candles
+2. Runs EMA 9/21 with an RSI filter (not a proven edge)
+3. Buys 25% of paper USD when the signal is BUY and it is flat
+4. Sells on a SELL signal or a 3% stop from all-in entry
+5. Halt new buys after -$10 realized that local day
+6. Telegram: start, fills, daily 7am LA scorecard
+
+Status line example:
 
 ```text
-BTC $65,914.06 | Strike $65,900.00 | T-08:42 | Above 57.20% | Below 42.80% | Mkt 53.0¢ | Edge +4.2¢ | SKIP  | Bank $100.00
+BTC/USD $76,466.92 | 1h | HOLD → HOLD | FLAT | eq $100.00
 ```
 
 ## Project Structure
 
 ```
 .
-├── config/              # Settings / env loading
-├── data/                # CCXT market data + Kalshi public feed
-├── prediction/          # Windowing, probability, advisor
-├── models/              # SQLAlchemy schemas
-├── strategies/          # Legacy EMA spot strategy (optional)
-├── execution/           # Paper prediction book (+ legacy spot broker)
-├── main.py              # Async entrypoint
+├── crypto_bot.py        # New venture entrypoint (paper BTC spot)
+├── main.py              # Legacy Kalshi 15m predictor (leave off)
+├── strategies/          # EMA crossover
+├── execution/           # PaperBroker + crypto risk
+├── data/                # Coinbase CCXT feed
 ├── .env.example
 └── requirements.txt
 ```
@@ -40,31 +59,13 @@ BTC $65,914.06 | Strike $65,900.00 | T-08:42 | Above 57.20% | Below 42.80% | Mkt
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-python main.py --reset-paper       # wipe W/L and start bank at $100
-python main.py
-```
-
-### Paper crypto spot bot (separate from Kalshi)
-
-The 15m Kalshi bot is a prediction-market scorer. Starting **crypto trading**
-is a different program: long-only BTC spot on 1h candles, paper first.
-
-```bash
 python crypto_bot.py
 ```
 
-Defaults: Coinbase `BTC/USD`, 1h EMA 9/21 + RSI filter, **0.60% taker fee**
-each way, **3% stop** from all-in entry, **25%** of USD per buy, one position,
-buy-halt after **-$10** realized on the local day. Database is
-`crypto_paper.db` so it cannot touch `live_trading.db`.
-
-`LIVE_CRYPTO` is hard-off. This is not a proven edge — it is plumbing + a
-dumb trend rule so paper P/L includes fees. Do not fund it with leftover
-Kalshi cash until a paper sample is actually green. Keep the Kalshi worker
-on `LIVE_TRADING=false`; do not run both live on one Render service.
+### Legacy Kalshi 15m bot (leave off)
 
 ### Paste Robinhood strike (optional now)
 

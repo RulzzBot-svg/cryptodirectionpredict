@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import load_settings
@@ -313,6 +313,20 @@ class PaperBroker:
             ]
         )
         print("\n".join(lines))
+
+    def reset_paper_history(self, *, balance: Optional[float] = None) -> None:
+        """Wipe spot trades and reset USD (used by crypto_bot --reset-paper)."""
+        cash = float(self.initial_balance if balance is None else balance)
+        with self.session_factory() as session:
+            session.execute(delete(Trade))
+            portfolio = self._get_portfolio_row(session)
+            portfolio.usd_balance = cash
+            portfolio.btc_balance = 0.0
+            portfolio.avg_entry_price = 0.0
+            portfolio.symbol = self.symbol
+            portfolio.updated_at = datetime.now(timezone.utc)
+            session.commit()
+        self._log(f"Reset paper portfolio | USD {cash:,.2f} | BTC 0")
 
     def get_trades(self) -> list[Trade]:
         with self.session_factory() as session:
